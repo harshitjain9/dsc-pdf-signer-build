@@ -1,0 +1,31 @@
+name: Build Broto DSC Signer (Windows)
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        working-directory: broto_signer
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build BrotoSigner.exe
+        working-directory: broto_signer
+        run: >
+          python -m PyInstaller --onefile --windowed --name BrotoSigner
+          --collect-all pyhanko --collect-all pyhanko_certvalidator
+          --collect-all asn1crypto --collect-all pkcs11 app.py
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BrotoSigner-windows
+          path: broto_signer/dist/BrotoSigner.exe
+          if-no-files-found: error
