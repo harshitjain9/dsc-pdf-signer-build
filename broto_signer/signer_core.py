@@ -275,6 +275,13 @@ class DscSigner:
             outf.write(out)
 
     def sign_icegate_json(self, in_path: str, out_path: str) -> None:
+        """File wrapper around :meth:`sign_icegate_json_bytes`."""
+        with open(in_path, "rb") as inf:
+            content = inf.read()
+        with open(out_path, "wb") as outf:
+            outf.write(self.sign_icegate_json_bytes(content))
+
+    def sign_icegate_json_bytes(self, content: bytes) -> bytes:
         """ICEGATE Open API JSON (CACHI01/CACHE01) signature — the digSign-OBJECT
         form the CACHE01/CACHI01 schema defines, as produced by Live Impex
         (Capricorn DSC) on real Aman Seatrans filings.
@@ -285,10 +292,9 @@ class DscSigner:
         inserted as a proper third top-level key by replacing the body's final
         ``}`` with ``,"digSign":{...}}`` — yielding valid JSON
         ``{headerField, master, digSign}``. A verifier reconstructs the signed
-        body as everything up to the ``,"digSign"`` marker plus ``}``."""
+        body as everything up to the ``,"digSign"`` marker plus ``}``.
+        Also used by the one-click bridge (bridge.py), which signs in memory."""
         import base64
-        with open(in_path, "rb") as inf:
-            content = inf.read()
         body = content.rstrip(b"\r\n")
         if not body.endswith(b"}"):
             raise ValueError("JSON payload does not end with '}' — cannot append digSign.")
@@ -300,15 +306,26 @@ class DscSigner:
             b'"signerVersion":"' + JSON_SIGNER_VERSION + b'"}'
         )
         # Replace the body's closing brace with the digSign key + a fresh close.
-        out = body[:-1] + b',"digSign":' + digsign + b"}"
-        with open(out_path, "wb") as outf:
-            outf.write(out)
+        return body[:-1] + b',"digSign":' + digsign + b"}"
 
     def close(self) -> None:
         try:
             self._session.close()
         except Exception:
             pass
+
+
+def pin_error_kind(exc: BaseException) -> Optional[str]:
+    """'wrong' for an incorrect PIN, 'locked' for a locked token, else None.
+    A saved PIN that comes back 'wrong' must be forgotten at once and never
+    retried — tokens lock after a handful of bad attempts."""
+    names = {type(e).__name__ for e in (exc, exc.__cause__, exc.__context__) if e is not None}
+    text = " ".join(str(e) for e in (exc, exc.__cause__) if e is not None).upper()
+    if names & {"PinLocked"} or "PIN_LOCKED" in text:
+        return "locked"
+    if names & {"PinIncorrect", "PinInvalid", "PinLenRange"} or "PIN_INCORRECT" in text:
+        return "wrong"
+    return None
 
 
 def output_path_for(in_path: str, out_dir: str) -> str:

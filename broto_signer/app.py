@@ -35,12 +35,14 @@ except Exception:  # noqa: BLE001
     DND_FILES = None
     TkinterDnD = None
 
-from signer_core import CertInfo, DscSigner, discover_module, list_certificates, sign_one
+import secure_store as store
+from bridge import BRIDGE_PORT, BridgeServer, SignRequest
+from signer_core import CertInfo, DscSigner, discover_module, list_certificates, pin_error_kind, sign_one
 
 APP_TITLE = "Broto DSC Signer"
 # Bump on every release — the planned self-updater compares this with the
-# server's "latest" record. 1.x = the original Tk UI; 2.0 = this redesign.
-APP_VERSION = "2.0.0"
+# server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN.
+APP_VERSION = "2.1.0"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -177,6 +179,220 @@ class FileRow(ctk.CTkFrame):
             self.detail.configure(text=os.path.dirname(self.path), text_color=MUTED)
 
 
+def _fmt_job_date(raw: str) -> str:
+    """ICEGATE job dates are 8 digits; show them as '22 Sep 2026' when the
+    order is unambiguous (YYYYMMDD or DDMMYYYY), else as sent."""
+    s = (raw or "").strip()
+    for fmt in ("%Y%m%d", "%d%m%Y"):
+        try:
+            d = datetime.strptime(s, fmt)
+            if 2000 <= d.year <= 2100:
+                return d.strftime("%d %b %Y")
+        except ValueError:
+            pass
+    return s
+
+
+def _popup_on_top(win) -> None:
+    """Bring a dialog to the front even when the main window is minimised."""
+    try:
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+        win.bell()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class ApprovalDialog(ctk.CTkToplevel):
+    """'Broto wants to sign this filing' — nothing is signed without a click here."""
+
+    def __init__(self, app: "SignerApp", req: SignRequest) -> None:
+        super().__init__(app.root)
+        self.app, self.req = app, req
+        self._working = False
+        s = req.summary
+        filing = req.action == "sign_and_file"
+        self.title("Broto wants to sign a filing")
+        self.geometry("500x560")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=22, pady=(20, 10))
+        top.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(top, text="b", width=40, height=40, corner_radius=11, fg_color=(NAVY, LIME),
+                     text_color=("#FFFFFF", NAVY), font=_font(21, "bold")).grid(row=0, column=0, rowspan=2, padx=(0, 12))
+        ctk.CTkLabel(top, text=("Sign & file this %s?" if filing else "Sign this %s?") % s["kind"],
+                     text_color=TEXT, font=_font(17, "bold"), anchor="w").grid(row=0, column=1, sticky="sw")
+        host = req.origin.split("//")[-1]
+        ctk.CTkLabel(top, text="Requested by Broto (%s) in your browser" % host, text_color=MUTED,
+                     font=_font(12), anchor="w").grid(row=1, column=1, sticky="nw")
+
+        card = Card(self)
+        card.grid(row=1, column=0, sticky="ew", padx=22)
+        card.grid_columnconfigure(1, weight=1)
+        party_label = "Importer" if s["message_id"] == "CACHI01" else "Exporter"
+        job = str(s.get("job_number") or "—")
+        if s.get("job_date"):
+            job += "  ·  " + _fmt_job_date(s["job_date"])
+        counts = "%d invoice%s  ·  %d item%s" % (s["invoices"], "" if s["invoices"] == 1 else "s",
+                                                 s["items"], "" if s["items"] == 1 else "s")
+        rows = [(party_label, s.get("party") or "—"), ("IEC", s.get("iec") or "—"), ("Job no.", job),
+                ("Contents", counts), ("ICEGATE ID", s.get("sender_id") or "—"), ("File", req.filename)]
+        for i, (k, v) in enumerate(rows):
+            ctk.CTkLabel(card, text=k, text_color=MUTED, font=_font(12), anchor="w").grid(
+                row=i, column=0, sticky="nw", padx=(16, 12), pady=(12 if i == 0 else 3, 12 if i == len(rows) - 1 else 3))
+            ctk.CTkLabel(card, text=v, text_color=TEXT, font=_font(13, "bold" if i == 0 else "normal"), anchor="w",
+                         justify="left", wraplength=300).grid(
+                row=i, column=1, sticky="nw", padx=(0, 16), pady=(12 if i == 0 else 3, 12 if i == len(rows) - 1 else 3))
+        if s.get("test_mode"):
+            ctk.CTkLabel(card, text="TEST FILING (ICEGATE test system)", height=24, corner_radius=8,
+                         fg_color=KIND[".json"][2], text_color=WARN, font=_font(11, "bold")).grid(
+                row=len(rows), column=0, columnspan=2, sticky="w", padx=16, pady=(0, 12))
+
+        cert = app._selected_cert()
+        cert_text = ("Signing as %s" % (cert.common_name or cert.display)) if cert else \
+            "Your certificate will be read from the token after you enter the PIN."
+        ctk.CTkLabel(self, text=cert_text, text_color=TEXT if cert else MUTED, font=_font(12, "bold" if cert else "normal"),
+                     anchor="w", wraplength=450, justify="left").grid(row=2, column=0, sticky="ew", padx=24, pady=(14, 6))
+
+        self.pin_box = ctk.CTkFrame(self, fg_color="transparent")
+        self.pin_box.grid(row=3, column=0, sticky="ew", padx=22)
+        self.pin_box.grid_columnconfigure(0, weight=1)
+        self.pin_entry = ctk.CTkEntry(self.pin_box, show="•", height=40, corner_radius=10,
+                                      placeholder_text="Token PIN", fg_color=FIELD, border_color=BORDER,
+                                      text_color=TEXT, font=_font(14))
+        self.remember = ctk.BooleanVar(value=False)
+        self.remember_cb = ctk.CTkCheckBox(self.pin_box, text="Remember my PIN on this computer",
+                                           variable=self.remember, text_color=TEXT, font=_font(12),
+                                           checkbox_width=18, checkbox_height=18, corner_radius=5,
+                                           fg_color=(NAVY, LIME), hover_color=("#1B3160", LIME_HOVER),
+                                           checkmark_color=("#FFFFFF", NAVY))
+        self.saved_lbl = ctk.CTkLabel(self.pin_box, text="●  Using the PIN saved on this computer",
+                                      text_color=OK, font=_font(12, "bold"), anchor="w")
+        self._use_saved = bool(app._saved_pin)
+        self._layout_pin()
+
+        self.err = ctk.CTkLabel(self, text="", text_color=ERR, font=_font(12), anchor="w",
+                                wraplength=450, justify="left")
+        self.err.grid(row=4, column=0, sticky="ew", padx=24, pady=(8, 0))
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=5, column=0, sticky="ew", padx=22, pady=(10, 20))
+        btns.grid_columnconfigure(0, weight=1)
+        self.cancel_btn = secondary_button(btns, "Cancel", self.cancel, width=110)
+        self.cancel_btn.grid(row=0, column=1, padx=(0, 10))
+        self.ok_btn = ctk.CTkButton(btns, text="Sign & file" if filing else "Sign", width=170, height=44,
+                                    corner_radius=12, fg_color=LIME, hover_color=LIME_HOVER, text_color=NAVY,
+                                    font=_font(14, "bold"), command=self.approve)
+        self.ok_btn.grid(row=0, column=2)
+
+        self.bind("<Return>", lambda _e: self.approve())
+        self.bind("<Escape>", lambda _e: self.cancel())
+        _popup_on_top(self)
+        self.after(150, lambda: (self.pin_entry.focus_set() if not self._use_saved else self.ok_btn.focus_set()))
+        self.after(1000, self._watch)
+
+    def _layout_pin(self) -> None:
+        for w in (self.pin_entry, self.remember_cb, self.saved_lbl):
+            w.grid_forget()
+        if self._use_saved:
+            self.saved_lbl.grid(row=0, column=0, sticky="w", padx=2)
+        else:
+            self.pin_entry.grid(row=0, column=0, sticky="ew")
+            if store.pin_saving_supported():
+                self.remember_cb.grid(row=1, column=0, sticky="w", padx=2, pady=(10, 0))
+
+    def _watch(self) -> None:
+        """Close if the browser gave up (bridge timeout) while we were open."""
+        if not self.winfo_exists():
+            return
+        if self.req.done and not self._working:
+            self.app._flash("A signing request from Broto timed out.", WARN)
+            self.destroy()
+            return
+        self.after(1000, self._watch)
+
+    def approve(self) -> None:
+        if self._working:
+            return
+        pin = self.app._saved_pin if self._use_saved else self.pin_entry.get().strip()
+        if not pin:
+            self.show_error("Enter the token PIN.")
+            return
+        self._working = True
+        self.ok_btn.configure(text="Signing…", state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.err.configure(text="")
+        remember = bool(self.remember.get()) and not self._use_saved
+        self.app._start_bridge_sign(self.req, pin, self._use_saved, remember)
+
+    def show_error(self, msg: str, need_pin: bool = False) -> None:
+        self._working = False
+        self.ok_btn.configure(text="Sign & file" if self.req.action == "sign_and_file" else "Sign", state="normal")
+        self.cancel_btn.configure(state="normal")
+        if need_pin and self._use_saved:
+            self._use_saved = False
+            self._layout_pin()
+        if need_pin:
+            self.pin_entry.delete(0, "end")
+            self.pin_entry.focus_set()
+        self.err.configure(text=msg)
+
+    def cancel(self) -> None:
+        if self._working:
+            return
+        self.req.fail("cancelled", "Cancelled in the Broto Signer.")
+        self.app._log("Declined a signing request from Broto.")
+        self.destroy()
+
+
+class SavePinDialog(ctk.CTkToplevel):
+    """Asked once after the PIN has been proven correct — never saved silently."""
+
+    def __init__(self, app: "SignerApp", pin: str) -> None:
+        super().__init__(app.root)
+        self.app, self.pin = app, pin
+        self.title("Save your token PIN?")
+        self.geometry("460x250")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.protocol("WM_DELETE_WINDOW", self.later)
+        self.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self, text="Save your token PIN on this computer?", text_color=TEXT,
+                     font=_font(16, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=22, pady=(20, 6))
+        ctk.CTkLabel(self, text="You won't have to type it again, here or when Broto asks for a signature. "
+                                "It is locked to your Windows login on this PC. Anyone who uses this Windows "
+                                "login while the token is plugged in could sign with it — you still confirm "
+                                "every signature. You can forget it any time in Settings.",
+                     text_color=MUTED, font=_font(12), anchor="w", justify="left", wraplength=416).grid(
+            row=1, column=0, sticky="ew", padx=22)
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=22, pady=(18, 20))
+        btns.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(btns, text="Don't ask again", width=120, height=36, fg_color="transparent",
+                      hover_color=ROW_HOVER, text_color=MUTED, font=_font(12), command=self.never).grid(row=0, column=0, sticky="w")
+        secondary_button(btns, "Not now", self.later, width=96).grid(row=0, column=1, padx=(0, 10))
+        ctk.CTkButton(btns, text="Save PIN", width=120, height=40, corner_radius=12, fg_color=LIME,
+                      hover_color=LIME_HOVER, text_color=NAVY, font=_font(14, "bold"),
+                      command=self.save).grid(row=0, column=2)
+        _popup_on_top(self)
+
+    def save(self) -> None:
+        self.app._remember_pin(self.pin)
+        self.destroy()
+
+    def later(self) -> None:
+        self.destroy()
+
+    def never(self) -> None:
+        store.update_settings(never_ask_pin=True)
+        self.destroy()
+
+
 # ------------------------------------------------------------------ app
 class SignerApp:
     def __init__(self, root: _Root) -> None:
@@ -187,7 +403,9 @@ class SignerApp:
         root.configure(fg_color=BG)
         self._set_icon()
 
-        self.module_var = ctk.StringVar(value=discover_module() or "")
+        self.settings = store.load_settings()
+        saved_mod = self.settings.get("module") or ""
+        self.module_var = ctk.StringVar(value=saved_mod if os.path.exists(saved_mod) else (discover_module() or ""))
         self.out_var = ctk.StringVar()
         self.cert_choice = ctk.StringVar()
         self.rows: List[FileRow] = []
@@ -199,16 +417,32 @@ class SignerApp:
         self._log_lines: List[str] = []
         self._log_win = None
         self._log_box = None
+        self._saved_pin: Optional[str] = store.load_pin()
+        self._asked_save_pin = False
+        self._token_lock = threading.Lock()     # one token session at a time (batch vs bridge)
+        self._approval: Optional[ApprovalDialog] = None
+        self._status_snapshot: dict = {}         # read by the bridge thread; written on the UI thread
 
         self._build()
+        self.bridge = BridgeServer(on_request=lambda req: self.q.put(("bridge_req", req)),
+                                   status=lambda: dict(self._status_snapshot))
+        self.bridge_ok = self.bridge.start()
         self._refresh()
         self._poll()
         if self.module_var.get():
             self._log("Token driver: " + self.module_var.get())
         else:
-            self._log("Couldn't find a token driver automatically — open Driver settings "
+            self._log("Couldn't find a token driver automatically — open Settings "
                       "and pick your token's DLL.")
             self._toggle_driver(True)
+        if self.bridge_ok:
+            self._log("One-click filing ready — Broto can ask this app for signatures (port %d)." % BRIDGE_PORT)
+        else:
+            self._log("One-click filing is OFF: " + (self.bridge.error or "could not start"))
+        if store.has_saved_pin() and not self._saved_pin:
+            store.forget_pin()   # saved under another Windows login / PC — useless here
+        if self._saved_pin and self.module_var.get():
+            self.root.after(400, self._connect)   # saved PIN → connect straight away
 
     # ---------------------------------------------------------- chrome
     def _set_icon(self) -> None:
@@ -238,12 +472,16 @@ class SignerApp:
                      font=_font(24, "bold")).grid(row=0, column=0, rowspan=2, padx=(0, 14))
         ctk.CTkLabel(head, text="Broto DSC Signer", text_color=TEXT, font=_font(20, "bold"),
                      anchor="w").grid(row=0, column=1, sticky="sw")
-        ctk.CTkLabel(head, text="Sign PDFs, flat files and ICEGATE JSON with your USB token. "
-                                "Nothing leaves this computer.",
+        ctk.CTkLabel(head, text="Sign with your USB token. Nothing leaves this computer.",
                      text_color=MUTED, font=_font(12), anchor="w").grid(row=1, column=1, sticky="nw")
-        self.pill = ctk.CTkLabel(head, text="", height=30, corner_radius=15, fg_color=CARD,
+        pills = ctk.CTkFrame(head, fg_color="transparent")
+        pills.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.bridge_pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
+                                        font=_font(12, "bold"))
+        self.bridge_pill.pack(side="left", padx=(0, 8))
+        self.pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
                                  font=_font(12, "bold"))
-        self.pill.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.pill.pack(side="left")
         secondary_button(head, "Activity log", self._open_log, width=110).grid(
             row=0, column=3, rowspan=2, sticky="e", padx=(10, 0))
 
@@ -275,7 +513,14 @@ class SignerApp:
                                       corner_radius=10, placeholder_text="Token PIN",
                                       fg_color=FIELD, border_color=BORDER, text_color=TEXT,
                                       font=_font(14))
-        self.pin_entry.grid(row=0, column=0, sticky="ew")
+        self.saved_chip = ctk.CTkFrame(pin_row, fg_color=ROW, corner_radius=10, height=40)
+        self.saved_chip.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self.saved_chip, text="●  PIN saved", text_color=OK, font=_font(13, "bold"),
+                     anchor="w").grid(row=0, column=0, sticky="w", padx=12, pady=6)
+        ctk.CTkButton(self.saved_chip, text="Forget", width=60, height=28, corner_radius=8,
+                      fg_color="transparent", hover_color=ROW_HOVER, text_color=MUTED, font=_font(12),
+                      command=self._forget_pin).grid(row=0, column=1, padx=(0, 6))
+        self._layout_pin_row()
         self.pin_entry.bind("<Return>", lambda _e: self._connect())
         self.pin_entry.bind("<KeyRelease>", lambda _e: self._refresh())
         self.connect_btn = ctk.CTkButton(pin_row, text="Connect", width=100, height=40,
@@ -306,7 +551,7 @@ class SignerApp:
         self.cert_expiry.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
 
         # Driver settings (collapsed unless auto-detect failed)
-        self.driver_toggle = ctk.CTkButton(card, text="▸ Driver settings", anchor="w", height=26,
+        self.driver_toggle = ctk.CTkButton(card, text="▸ Settings", anchor="w", height=26,
                                            fg_color="transparent", hover_color=ROW_HOVER,
                                            text_color=MUTED, font=_font(12),
                                            command=lambda: self._toggle_driver(not self._driver_open))
@@ -320,6 +565,12 @@ class SignerApp:
                      font=_font(11)).grid(row=1, column=0, sticky="ew")
         secondary_button(self.driver_box, "Detect", self._detect, width=64).grid(row=1, column=1, padx=(6, 0))
         secondary_button(self.driver_box, "Browse", self._browse_module, width=64).grid(row=1, column=2, padx=(6, 0))
+        if store.autostart_supported():
+            self.autostart_var = ctk.BooleanVar(value=store.autostart_enabled())
+            ctk.CTkSwitch(self.driver_box, text="Open when Windows starts (for one-click filing)",
+                          variable=self.autostart_var, command=self._toggle_autostart, text_color=TEXT,
+                          font=_font(12), progress_color=(NAVY, LIME), switch_width=36,
+                          switch_height=18).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
     def _build_files_card(self, parent) -> None:
         card = Card(parent)
@@ -428,7 +679,41 @@ class SignerApp:
             self._log("Skipped %d file(s) that aren't PDF / .be / .sb / .json." % len(skipped))
 
     def _pin(self) -> str:
-        return self.pin_entry.get().strip()
+        return self._saved_pin or self.pin_entry.get().strip()
+
+    def _layout_pin_row(self) -> None:
+        if self._saved_pin:
+            self.pin_entry.grid_forget()
+            self.saved_chip.grid(row=0, column=0, sticky="ew")
+        else:
+            self.saved_chip.grid_forget()
+            self.pin_entry.grid(row=0, column=0, sticky="ew")
+
+    def _remember_pin(self, pin: str) -> None:
+        try:
+            store.save_pin(pin)
+        except Exception as e:  # noqa: BLE001
+            self._log("Couldn't save the PIN: %s" % e)
+            return
+        self._saved_pin = pin
+        self.pin_entry.delete(0, "end")
+        self._layout_pin_row()
+        self._log("Token PIN saved on this computer (locked to your Windows login).")
+        self._refresh()
+
+    def _forget_pin(self, reason: str = "") -> None:
+        store.forget_pin()
+        self._saved_pin = None
+        self._layout_pin_row()
+        self._log(reason or "Saved PIN removed from this computer.")
+        self._refresh()
+
+    def _toggle_autostart(self) -> None:
+        try:
+            store.set_autostart(bool(self.autostart_var.get()))
+            self._log("Open when Windows starts: %s" % ("on" if self.autostart_var.get() else "off"))
+        except Exception as e:  # noqa: BLE001
+            self._log("Couldn't change the start-up setting: %s" % e)
 
     def _selected_cert(self) -> Optional[CertInfo]:
         labels = [c.display for c in self.certs]
@@ -452,6 +737,16 @@ class SignerApp:
             self.pill.configure(text="  ●  Token connected  ", text_color=OK)
         else:
             self.pill.configure(text="  ●  Token not connected  ", text_color=MUTED)
+        if getattr(self, "bridge_ok", False):
+            self.bridge_pill.configure(text="  ⚡  One-click filing on  ", text_color=OK)
+        else:
+            self.bridge_pill.configure(text="  One-click filing off  ", text_color=ERR)
+        self._status_snapshot = {
+            "version": APP_VERSION,
+            "token_connected": bool(self.certs),
+            "certificate": (cert.common_name or cert.display) if cert else None,
+            "pin_saved": bool(self._saved_pin),
+        }
         ready = bool(cert and n and self._pin()) and not self._busy
         if self._busy:
             self.sign_btn.configure(text="Signing…", state="disabled", fg_color=ROW_HOVER)
@@ -473,6 +768,9 @@ class SignerApp:
 
     def _show_cert(self) -> None:
         c = self._selected_cert()
+        if c:
+            self.settings = store.update_settings(cert_id=c.cert_id.hex() or None, cert_label=c.label or None,
+                                                  slot_index=c.slot_index)
         if not c:
             self.cert_name.configure(text="No certificate yet", text_color=MUTED)
             self.cert_issuer.configure(text="Connect to read the certificate on your token.")
@@ -497,10 +795,10 @@ class SignerApp:
     def _toggle_driver(self, open_: bool) -> None:
         self._driver_open = open_
         if open_:
-            self.driver_toggle.configure(text="▾ Driver settings")
+            self.driver_toggle.configure(text="▾ Settings")
             self.driver_box.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 16))
         else:
-            self.driver_toggle.configure(text="▸ Driver settings")
+            self.driver_toggle.configure(text="▸ Settings")
             self.driver_box.grid_forget()
 
     # ---------------------------------------------------------- token
@@ -524,7 +822,7 @@ class SignerApp:
         mod = self.module_var.get().strip()
         if not mod or not os.path.exists(mod):
             self._toggle_driver(True)
-            self._flash("Pick your token's driver first (Driver settings).", ERR)
+            self._flash("Pick your token's driver first (Settings).", ERR)
             return
         self._busy = True
         self.connect_btn.configure(text="…")
@@ -622,6 +920,10 @@ class SignerApp:
         threading.Thread(target=self._sign_worker, args=args, daemon=True).start()
 
     def _sign_worker(self, module, cert_id, cert_label, slot_index, pin, files, out_dir) -> None:
+        with self._token_lock:
+            self._sign_batch(module, cert_id, cert_label, slot_index, pin, files, out_dir)
+
+    def _sign_batch(self, module, cert_id, cert_label, slot_index, pin, files, out_dir) -> None:
         ok = fail = 0
         signer = None
         try:
@@ -642,12 +944,12 @@ class SignerApp:
         except Exception as e:  # noqa: BLE001 - session-level failure (wrong PIN, locked token, …)
             fail = len(files) - ok
             self._log("ERROR: " + repr(e))
-            self.q.put(("session_err", str(e) or repr(e)))
+            self.q.put(("session_err", str(e) or repr(e), pin_error_kind(e), pin))
         finally:
             if signer:
                 signer.close()
         self._log("Done — %d signed, %d failed. Saved to %s" % (ok, fail, out_dir))
-        self.q.put(("done", ok, fail, out_dir))
+        self.q.put(("done", ok, fail, out_dir, pin))
 
     # ---------------------------------------------------------- queue / log
     def _poll(self) -> None:
@@ -672,7 +974,10 @@ class SignerApp:
             else:
                 labels = [c.display for c in self.certs]
                 self.cert_menu.configure(values=labels)
-                self.cert_choice.set(labels[0])
+                want = self.settings.get("cert_id")
+                pick = next((i for i, c in enumerate(self.certs) if want and c.cert_id.hex() == want), 0)
+                self.cert_choice.set(labels[pick])
+                self.settings = store.update_settings(module=self.module_var.get().strip())
                 if len(self.certs) > 1:
                     self.cert_menu.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
                 else:
@@ -695,9 +1000,23 @@ class SignerApp:
         elif kind == "progress":
             self.progress.set(item[1])
         elif kind == "session_err":
-            self._flash("Couldn't open the token: " + item[1][:80], ERR)
+            _, msg, pin_kind, pin = item
+            if pin_kind == "wrong":
+                if self._saved_pin and pin == self._saved_pin:
+                    self._forget_pin("The token rejected the saved PIN, so it was removed. Type the PIN again.")
+                self._flash("Wrong PIN. The token locks after a few wrong tries.", ERR)
+            elif pin_kind == "locked":
+                self._flash("The token is locked. Unlock it with your token's own tool.", ERR)
+            else:
+                self._flash("Couldn't open the token: " + msg[:80], ERR)
+        elif kind == "bridge_req":
+            self._on_bridge_request(item[1])
+        elif kind == "bridge_done":
+            self._bridge_done(*item[1:])
+        elif kind == "bridge_err":
+            self._bridge_err(*item[1:])
         elif kind == "done":
-            _, ok, fail, out_dir = item
+            _, ok, fail, out_dir, pin = item
             self._busy = False
             self._last_out = out_dir
             self.progress.pack_forget()
@@ -708,6 +1027,104 @@ class SignerApp:
                 self._flash("%d signed · %d failed" % (ok, fail), ERR if not ok else WARN)
             if ok and os.path.isdir(out_dir):
                 self.open_btn.grid(row=0, column=2, padx=(8, 0))
+            if ok:
+                self._maybe_offer_save_pin(pin)
+
+    # ---------------------------------------------------------- saved PIN
+    def _maybe_offer_save_pin(self, pin: str) -> None:
+        """Offer once per session, only after the PIN has just worked."""
+        if (self._saved_pin or self._asked_save_pin or not pin or not store.pin_saving_supported()
+                or store.load_settings().get("never_ask_pin")):
+            return
+        self._asked_save_pin = True
+        SavePinDialog(self, pin)
+
+    # ---------------------------------------------------------- one-click bridge
+    def _on_bridge_request(self, req: SignRequest) -> None:
+        if self._approval is not None and self._approval.winfo_exists():
+            req.fail("busy", "The Broto Signer is already showing a request.")
+            return
+        s = req.summary
+        self._log("Broto asks to sign %s (job %s, %s)." % (s["kind"], s.get("job_number"), req.filename))
+        if self.root.state() == "iconic":
+            self.root.deiconify()
+        self._approval = ApprovalDialog(self, req)
+
+    def _start_bridge_sign(self, req: SignRequest, pin: str, from_saved: bool, remember: bool) -> None:
+        cert = self._selected_cert()
+        module = self.module_var.get().strip()
+        want = self.settings.get("cert_id")
+
+        def work() -> None:
+            try:
+                if not module or not os.path.exists(module):
+                    raise RuntimeError("Token driver not set — open the Broto Signer's Settings.")
+                with self._token_lock:
+                    use, listed = cert, None
+                    if use is None:
+                        listed = list_certificates(module, pin)
+                        if not listed:
+                            raise RuntimeError("No certificate found on the token. Is it plugged in?")
+                        match = [c for c in listed if want and c.cert_id.hex() == want]
+                        if match:
+                            use = match[0]
+                        elif len(listed) == 1:
+                            use = listed[0]
+                        else:
+                            raise RuntimeError("This token has %d certificates — connect and pick one in the "
+                                               "Broto Signer window, then try again." % len(listed))
+                    signer = DscSigner(module, pin, cert_id=use.cert_id, cert_label=use.label,
+                                       slot_index=use.slot_index)
+                    try:
+                        signed = signer.sign_icegate_json_bytes(req.content)
+                    finally:
+                        signer.close()
+                self.q.put(("bridge_done", req, signed, pin, from_saved, remember, listed))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("bridge_err", req, pin_error_kind(e), str(e) or repr(e), from_saved))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bridge_done(self, req, signed, pin, from_saved, remember, listed) -> None:
+        req.finish(signed)
+        dlg, self._approval = self._approval, None
+        if dlg is not None and dlg.winfo_exists():
+            dlg.destroy()
+        if listed and not self.certs:
+            self._handle(("certs", listed))
+        s = req.summary
+        self._log("✓ Signed %s for job %s — handed back to Broto." % (s["kind"], s.get("job_number")))
+        self._flash("✓  Signed %s (job %s) — Broto is filing it" % (s["kind"], s.get("job_number")), OK)
+        if remember:
+            self._remember_pin(pin)
+        elif not from_saved:
+            self._maybe_offer_save_pin(pin)
+
+    def _bridge_err(self, req, pin_kind, msg, from_saved) -> None:
+        dlg = self._approval
+        alive = dlg is not None and dlg.winfo_exists()
+        if pin_kind == "locked":
+            req.fail("pin_locked", "The DSC token is locked.")
+            if alive:
+                dlg.destroy()
+            self._approval = None
+            self._flash("The token is locked. Unlock it with your token's own tool.", ERR)
+            return
+        if pin_kind == "wrong":
+            if from_saved:
+                self._forget_pin("The token rejected the saved PIN, so it was removed.")
+                text = "The token rejected your saved PIN, so it was removed. Type the PIN."
+            else:
+                text = "Wrong PIN. Careful — the token locks after a few wrong tries."
+            if alive:
+                dlg.show_error(text, need_pin=True)
+            else:
+                req.fail("wrong_pin", text)
+            return
+        self._log("Signing for Broto failed: " + msg)
+        if alive:
+            dlg.show_error("Couldn't sign: " + msg[:200])
+        else:
+            req.fail("failed", msg[:300])
 
     def _flash(self, msg: str, color) -> None:
         self.status_lbl.configure(text=msg, text_color=color)
@@ -751,6 +1168,8 @@ def main() -> None:
     ctk.set_default_color_theme("blue")
     root = _Root()
     SignerApp(root)
+    if "--minimized" in sys.argv:        # started with Windows — wait quietly for Broto
+        root.after(300, root.iconify)
     root.mainloop()
 
 

@@ -47,7 +47,7 @@ send me the message and I'll add the right `--collect`/`--hidden-import`.)
 ## How to use
 1. Plug in the DSC token.
 2. Launch `BrotoSigner.exe`. It auto-detects the token driver; if it can't,
-   **Driver settings** opens so you can pick the PKCS#11 DLL
+   **Settings** opens so you can pick the PKCS#11 DLL
    (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
 3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
    name, the issuing CA and the expiry date (amber inside 30 days, red once
@@ -58,6 +58,37 @@ send me the message and I'll add the right `--collect`/`--hidden-import`.)
    reason). **Open folder** jumps to the signed files; **Activity** keeps the log.
 
 The UI is CustomTkinter and follows the Windows light/dark setting.
+
+## One-click filing from Broto (`bridge.py`)
+While the app is open it listens on **`http://127.0.0.1:47811`** — this PC only.
+In Broto's **File on ICEGATE (API)** box, **Sign & file on ICEGATE** sends the
+unsigned BE/SB JSON here; the app pops up **"Sign & file this Bill of Entry?"**
+with the importer/exporter, IEC, job no., invoice/item counts, ICEGATE ID and
+the certificate — all read from the payload itself. **Sign & file** returns the
+signed JSON to the browser, which uploads it to Broto; Broto's server verifies
+the signature and submits to ICEGATE. The app never talks to ICEGATE or Broto.
+
+Guard rails: 127.0.0.1 only; Host header must be 127.0.0.1/localhost (blocks
+DNS rebinding); only Broto's origin (`https://brotoai.com`, `www.`) may call it
+(`BROTO_SIGNER_ORIGINS=http://localhost:3000` adds dev origins); only unsigned
+CACHI01/CACHE01 filings are accepted (never a general signing oracle); every
+request needs a click in the popup; one request at a time; 5-minute timeout.
+The header pill shows **⚡ One-click filing on**. A second copy of the app
+can't claim the port, so its pill says off.
+
+**Settings → Open when Windows starts** adds a current-user Run entry that
+launches the app minimised at login, so it's ready when Broto asks.
+
+## Saved PIN (optional, Windows only)
+After a PIN has **just worked** (a successful batch, or a one-click signature),
+the app asks once: **Save PIN / Not now / Don't ask again**. The popup also has
+a *Remember my PIN on this computer* tick box (off by default). Nothing is
+saved without that yes. The PIN is encrypted with **Windows DPAPI**
+(current-user scope, `secure_store.py`) in `%APPDATA%\BrotoSigner\settings.json`:
+only the same Windows login on the same PC can decrypt it. Every signature
+still needs the popup click. **Forget** (next to "PIN saved") removes it.
+If the token ever rejects the saved PIN, it is deleted immediately and never
+retried, because tokens lock after a few wrong PINs.
 
 ---
 

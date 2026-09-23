@@ -17,6 +17,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller pillow
+      - name: Bridge + settings tests (incl. Windows DPAPI PIN round-trip)
+        run: |
+          pip install pytest
+          python -m pytest tests/test_broto_signer_bridge.py -q
       - name: Build BrotoSigner.exe
         working-directory: broto_signer
         run: >
@@ -41,7 +45,8 @@ jobs:
         run: |
           try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "resolution unchanged" }
           New-Item -ItemType Directory -Force shots | Out-Null
-          foreach ($m in "light","dark") { foreach ($s in "empty","ready","done","log") {
+          $ErrorActionPreference = "Continue"
+          foreach ($m in "light","dark") { foreach ($s in "empty","ready","done","log","approve","savepin") {
             python ci/shot.py $m $s "shots/$m-$s.png"
           } }
       - name: Upload exe artifact
