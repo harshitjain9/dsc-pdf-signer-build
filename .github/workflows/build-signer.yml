@@ -41,13 +41,16 @@ jobs:
           Write-Host "exe still running after 20s - OK"
       - name: UI screenshots
         continue-on-error: true
+        timeout-minutes: 6
         shell: pwsh
         run: |
           try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "resolution unchanged" }
           New-Item -ItemType Directory -Force shots | Out-Null
           $ErrorActionPreference = "Continue"
           foreach ($m in "light","dark") { foreach ($s in "empty","ready","done","log","approve","savepin") {
+            Write-Host "== $m $s"
             python ci/shot.py $m $s "shots/$m-$s.png"
+            Write-Host "exit $LASTEXITCODE"
           } }
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4

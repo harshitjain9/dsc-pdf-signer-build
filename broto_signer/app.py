@@ -953,9 +953,19 @@ class SignerApp:
 
     # ---------------------------------------------------------- queue / log
     def _poll(self) -> None:
+        # One bad message must never stop the loop — a dead loop would leave
+        # Broto's signing requests unanswered until the 5-minute timeout.
         try:
             while True:
-                self._handle(self.q.get_nowait())
+                item = self.q.get_nowait()
+                try:
+                    self._handle(item)
+                except Exception:  # noqa: BLE001
+                    import traceback
+                    self._write("INTERNAL ERROR: " + traceback.format_exc(limit=3).strip().splitlines()[-1])
+                    traceback.print_exc()
+                    if item and item[0] == "bridge_req":
+                        item[1].fail("failed", "The Broto Signer hit an internal error — see its Activity log.")
         except queue.Empty:
             pass
         self.root.after(100, self._poll)

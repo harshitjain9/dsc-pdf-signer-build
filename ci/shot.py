@@ -47,6 +47,11 @@ if stage == "approve":
     root.after(1200, lambda: threading.Thread(target=post, daemon=True).start())
 if stage == "savepin":
     root.after(1200, lambda: setattr(a, "_savepin", A.SavePinDialog(a, "12345678")))
+import traceback
+def _report(exc, val, tb):
+    traceback.print_exception(exc, val, tb); sys.stdout.flush(); os._exit(3)
+root.report_callback_exception = _report          # any Tk-callback error: print + exit, never hang
+root.after(25000, lambda: (print("WATCHDOG: stage %s never finished" % stage, flush=True), os._exit(4)))
 def snap():
     target = root
     if stage == "log" and a._log_win is not None: target = a._log_win
