@@ -1,8 +1,11 @@
 # Broto DSC Signer — runtime deps.
 # pyHanko does the PKCS#11 token signing (PAdES for PDFs, CMS for flat files);
 # the [pkcs11] extra pulls python-pkcs11. asn1crypto comes transitively.
-# Tkinter (the GUI) ships with Python — nothing to install for it.
 pyHanko[pkcs11]>=0.20.0
+# GUI: CustomTkinter (modern rounded widgets, light/dark) on top of the Tkinter
+# that ships with Python; tkinterdnd2 adds drag-and-drop (optional at runtime).
+customtkinter>=5.2.0
+tkinterdnd2>=0.4.0
 
 # Only needed to build the .exe (not to run from source):
 #   pip install pyinstaller

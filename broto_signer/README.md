@@ -31,10 +31,13 @@ On the Windows machine:
 pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --onefile --windowed --name BrotoSigner ^
+  --icon assets\broto.ico --add-data "assets;assets" ^
   --collect-all pyhanko ^
   --collect-all pyhanko_certvalidator ^
   --collect-all asn1crypto ^
-  --collect-submodules pkcs11 ^
+  --collect-all pkcs11 ^
+  --collect-all customtkinter ^
+  --collect-all tkinterdnd2 ^
   app.py
 ```
 The result is **`dist\BrotoSigner.exe`** — a single file you can copy to any
@@ -43,12 +46,18 @@ send me the message and I'll add the right `--collect`/`--hidden-import`.)
 
 ## How to use
 1. Plug in the DSC token.
-2. Launch `BrotoSigner.exe`. It auto-detects the token driver; if not, set the
-   PKCS#11 DLL path (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
-3. Enter the **token PIN** → **Load certificates** → pick your certificate.
-4. **Add files** (or **Add folder** for a whole batch) → set the **output
-   folder** → **Sign**.
-5. Signed files land in the output folder; the log shows one line per file.
+2. Launch `BrotoSigner.exe`. It auto-detects the token driver; if it can't,
+   **Driver settings** opens so you can pick the PKCS#11 DLL
+   (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
+3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
+   name, the issuing CA and the expiry date (amber inside 30 days, red once
+   expired). Tokens with several certificates get a picker.
+4. **Drag files in** (or a whole folder), or use **Add files / Add folder** →
+   optionally **Change…** the output folder → **Sign N files**.
+5. Each file row turns green (✓ with the signed file's name) or red (with the
+   reason). **Open folder** jumps to the signed files; **Activity** keeps the log.
+
+The UI is CustomTkinter and follows the Windows light/dark setting.
 
 ---
 

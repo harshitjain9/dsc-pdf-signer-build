@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import platform
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional
 
 # The <SIGNER-VERSION> value stamped into signed flat files. ICEGATE appears to
@@ -72,12 +73,46 @@ class CertInfo:
     subject: str
     cert_id: bytes = b""  # CKA_ID — the reliable selector when the label is empty
     slot_index: int = 0   # which token slot it lives in (multi-slot readers)
+    common_name: str = ""             # holder name (subject CN)
+    issuer: str = ""                  # issuing CA (issuer CN / O)
+    not_after: Optional[datetime] = None   # expiry (UTC)
 
     @property
     def display(self) -> str:
-        if self.label and self.subject:
-            return "%s — %s" % (self.label, self.subject)
-        return self.label or self.subject or "(unlabeled certificate)"
+        name = self.common_name or self.subject
+        if self.label and name and self.label != name:
+            return "%s — %s" % (name, self.label)
+        return name or self.label or "Certificate in slot %d" % (self.slot_index + 1)
+
+
+def _describe_cert(der: bytes) -> dict:
+    """Best-effort holder / issuer / expiry from a DER certificate. Each field is
+    read on its own: Indian DSCs carry unusual subject attributes that can make
+    one accessor fail while the others still work."""
+    from asn1crypto import x509
+    out = {"subject": "", "common_name": "", "issuer": "", "not_after": None}
+    try:
+        cert = x509.Certificate.load(der)
+    except Exception:
+        return out
+    try:
+        out["subject"] = cert.subject.human_friendly
+    except Exception:
+        pass
+    try:
+        out["common_name"] = cert.subject.native.get("common_name") or ""
+    except Exception:
+        pass
+    try:
+        iss = cert.issuer.native
+        out["issuer"] = iss.get("common_name") or iss.get("organization_name") or ""
+    except Exception:
+        pass
+    try:
+        out["not_after"] = cert.not_valid_after
+    except Exception:
+        pass
+    return out
 
 
 def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
@@ -86,7 +121,6 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
     until authenticated."""
     import pkcs11
     from pkcs11 import Attribute, ObjectClass
-    from asn1crypto import x509
 
     lib = pkcs11.lib(module)
     out: List[CertInfo] = []
@@ -114,16 +148,16 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
                 cert_id = bytes(cert[Attribute.ID])
             except Exception:
                 pass
-            subject = ""
+            info = {"subject": "", "common_name": "", "issuer": "", "not_after": None}
             try:
-                subject = x509.Certificate.load(cert[Attribute.VALUE]).subject.human_friendly
+                info = _describe_cert(bytes(cert[Attribute.VALUE]))
             except Exception:
                 pass
-            key = (label, subject, cert_id)
+            key = (label, info["subject"], cert_id)
             if key in seen:
                 continue
             seen.add(key)
-            out.append(CertInfo(label=label or "", subject=subject, cert_id=cert_id, slot_index=slot_index))
+            out.append(CertInfo(label=label or "", cert_id=cert_id, slot_index=slot_index, **info))
     return out
 
 

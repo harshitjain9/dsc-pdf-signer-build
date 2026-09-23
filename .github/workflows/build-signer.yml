@@ -16,16 +16,43 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
       - name: Build BrotoSigner.exe
         working-directory: broto_signer
         run: >
           python -m PyInstaller --onefile --windowed --name BrotoSigner
+          --icon assets/broto.ico --add-data "assets;assets"
           --collect-all pyhanko --collect-all pyhanko_certvalidator
-          --collect-all asn1crypto --collect-all pkcs11 app.py
+          --collect-all asn1crypto --collect-all pkcs11
+          --collect-all customtkinter --collect-all tkinterdnd2 app.py
+      - name: Smoke-test the exe starts
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:TEMP "BrotoSigner-error.log"
+          if (Test-Path $log) { Remove-Item $log }
+          $p = Start-Process -FilePath broto_signer/dist/BrotoSigner.exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { if (Test-Path $log) { Get-Content $log }; throw "exe exited early (code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "exe still running after 20s - OK"
+      - name: UI screenshots
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "resolution unchanged" }
+          New-Item -ItemType Directory -Force shots | Out-Null
+          foreach ($m in "light","dark") { foreach ($s in "empty","ready","done") {
+            python ci/shot.py $m $s "shots/$m-$s.png"
+          } }
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: BrotoSigner-windows
           path: broto_signer/dist/BrotoSigner.exe
           if-no-files-found: error
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots
+          path: shots/
+          if-no-files-found: warn
