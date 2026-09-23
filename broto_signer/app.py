@@ -195,6 +195,10 @@ def _fmt_job_date(raw: str) -> str:
 
 def _popup_on_top(win) -> None:
     """Bring a dialog to the front even when the main window is minimised."""
+    ico = _resource("assets", "broto.ico")
+    if sys.platform == "win32" and os.path.exists(ico):
+        # CTkToplevel swaps in its own icon ~200 ms after creation; set ours after.
+        win.after(250, lambda: win.winfo_exists() and win.iconbitmap(ico))
     try:
         win.attributes("-topmost", True)
         win.lift()
@@ -765,6 +769,8 @@ class SignerApp:
                 self.status_lbl.configure(text="Connect your token to start", text_color=MUTED)
             elif not n:
                 self.status_lbl.configure(text="Add the files you want to sign", text_color=MUTED)
+            elif self.status_lbl.cget("text") in ("Connect your token to start", "Add the files you want to sign"):
+                self.status_lbl.configure(text="")
 
     def _show_cert(self) -> None:
         c = self._selected_cert()
@@ -1160,6 +1166,9 @@ class SignerApp:
             return
         win = ctk.CTkToplevel(self.root)
         win.title("Activity log — " + APP_TITLE)
+        ico = _resource("assets", "broto.ico")
+        if sys.platform == "win32" and os.path.exists(ico):
+            win.after(250, lambda: win.winfo_exists() and win.iconbitmap(ico))
         win.geometry("640x380")
         win.configure(fg_color=BG)
         win.transient(self.root)
