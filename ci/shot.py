@@ -12,13 +12,15 @@ demo = tempfile.mkdtemp()
 for f in ("4382026.json", "4462026.json", "SB_4382026.sb", "INV-2231.pdf"):
     open(os.path.join(demo, f), "w").write("{}")
 root = A._Root(); a = A.SignerApp(root)
-a.pin_var.trace_add("write", lambda *_: a._refresh())
 if stage != "empty":
-    a.pin_var.set("12345678")
+    a.pin_entry.insert(0, "12345678")
     a.q.put(("certs", [CertInfo(label="", subject="", common_name="HARSHIT JAIN",
                                 issuer="e-Mudhra Sub CA for Class 3 Individual 2022",
                                 not_after=datetime.datetime(2027, 3, 14, tzinfo=datetime.timezone.utc))]))
     a._add([os.path.join(demo, f) for f in sorted(os.listdir(demo))])
+if stage == "log":
+    a._log("Token driver: C:\\Windows\\System32\\SignatureP11.dll")
+    root.after(800, a._open_log)
 if stage == "done":
     for i, r in enumerate(a.rows):
         if i == 2:
@@ -31,7 +33,9 @@ def snap():
     root.update()
     import ctypes.wintypes as wt
     rect = wt.RECT()
-    hwnd = int(root.wm_frame(), 16)
+    target = a._log_win if stage == "log" and a._log_win is not None else root
+    target.update()
+    hwnd = int(target.wm_frame(), 16)
     ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
     ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True).save(out)
     root.destroy()

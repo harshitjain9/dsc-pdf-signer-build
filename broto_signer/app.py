@@ -38,6 +38,9 @@ except Exception:  # noqa: BLE001
 from signer_core import CertInfo, DscSigner, discover_module, list_certificates, sign_one
 
 APP_TITLE = "Broto DSC Signer"
+# Bump on every release — the planned self-updater compares this with the
+# server's "latest" record. 1.x = the original Tk UI; 2.0 = this redesign.
+APP_VERSION = "2.0.0"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -178,14 +181,13 @@ class FileRow(ctk.CTkFrame):
 class SignerApp:
     def __init__(self, root: _Root) -> None:
         self.root = root
-        root.title(APP_TITLE)
+        root.title("%s  v%s" % (APP_TITLE, APP_VERSION))
         root.geometry("980x640")
         root.minsize(820, 560)
         root.configure(fg_color=BG)
         self._set_icon()
 
         self.module_var = ctk.StringVar(value=discover_module() or "")
-        self.pin_var = ctk.StringVar()
         self.out_var = ctk.StringVar()
         self.cert_choice = ctk.StringVar()
         self.rows: List[FileRow] = []
@@ -194,6 +196,9 @@ class SignerApp:
         self._busy = False
         self._driver_open = False
         self._last_out: Optional[str] = None
+        self._log_lines: List[str] = []
+        self._log_win = None
+        self._log_box = None
 
         self._build()
         self._refresh()
@@ -239,16 +244,17 @@ class SignerApp:
         self.pill = ctk.CTkLabel(head, text="", height=30, corner_radius=15, fg_color=CARD,
                                  font=_font(12, "bold"))
         self.pill.grid(row=0, column=2, rowspan=2, sticky="e")
+        secondary_button(head, "Activity log", self._open_log, width=110).grid(
+            row=0, column=3, rowspan=2, sticky="e", padx=(10, 0))
 
         # Body --------------------------------------------------------
         body = ctk.CTkFrame(r, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew", padx=24)
         body.grid_columnconfigure(0, weight=0, minsize=340)
         body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
         self._build_token_card(body)
-        self._build_activity_card(body)
         self._build_files_card(body)
 
         # Footer ------------------------------------------------------
@@ -256,7 +262,7 @@ class SignerApp:
 
     def _build_token_card(self, parent) -> None:
         card = Card(parent)
-        card.grid(row=0, column=0, sticky="new", padx=(0, 16), pady=(0, 16))
+        card.grid(row=0, column=0, sticky="nsew", padx=(0, 16), pady=(0, 16))
         card.grid_columnconfigure(0, weight=1)
         step_title(card, "1", "Your DSC token").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 4))
         ctk.CTkLabel(card, text="Plug in the token and enter its PIN.", text_color=MUTED,
@@ -265,15 +271,16 @@ class SignerApp:
         pin_row = ctk.CTkFrame(card, fg_color="transparent")
         pin_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(12, 0))
         pin_row.grid_columnconfigure(0, weight=1)
-        self.pin_entry = ctk.CTkEntry(pin_row, textvariable=self.pin_var, show="•", height=40,
+        self.pin_entry = ctk.CTkEntry(pin_row, show="•", height=40,
                                       corner_radius=10, placeholder_text="Token PIN",
                                       fg_color=FIELD, border_color=BORDER, text_color=TEXT,
                                       font=_font(14))
         self.pin_entry.grid(row=0, column=0, sticky="ew")
         self.pin_entry.bind("<Return>", lambda _e: self._connect())
+        self.pin_entry.bind("<KeyRelease>", lambda _e: self._refresh())
         self.connect_btn = ctk.CTkButton(pin_row, text="Connect", width=100, height=40,
-                                         corner_radius=10, fg_color=NAVY, hover_color="#1B3160",
-                                         text_color="#FFFFFF", font=_font(13, "bold"),
+                                         corner_radius=10, fg_color=(NAVY, LIME), hover_color=("#1B3160", LIME_HOVER),
+                                         text_color=("#FFFFFF", NAVY), font=_font(13, "bold"),
                                          command=self._connect)
         self.connect_btn.grid(row=0, column=1, padx=(8, 0))
 
@@ -314,22 +321,9 @@ class SignerApp:
         secondary_button(self.driver_box, "Detect", self._detect, width=64).grid(row=1, column=1, padx=(6, 0))
         secondary_button(self.driver_box, "Browse", self._browse_module, width=64).grid(row=1, column=2, padx=(6, 0))
 
-    def _build_activity_card(self, parent) -> None:
-        card = Card(parent)
-        card.grid(row=1, column=0, sticky="nsew", padx=(0, 16), pady=(0, 16))
-        card.grid_columnconfigure(0, weight=1)
-        card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(card, text="Activity", text_color=TEXT, font=_font(13, "bold"),
-                     anchor="w").grid(row=0, column=0, sticky="w", padx=18, pady=(12, 4))
-        self.log = ctk.CTkTextbox(card, fg_color="transparent", text_color=MUTED, wrap="word",
-                                  font=ctk.CTkFont(family="Consolas" if sys.platform == "win32" else "Menlo",
-                                                   size=11),
-                                  activate_scrollbars=True, state="disabled")
-        self.log.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
-
     def _build_files_card(self, parent) -> None:
         card = Card(parent)
-        card.grid(row=0, column=1, rowspan=2, sticky="nsew", pady=(0, 16))
+        card.grid(row=0, column=1, sticky="nsew", pady=(0, 16))
         card.grid_columnconfigure(0, weight=1)
         card.grid_rowconfigure(1, weight=1)
         self.files_card = card
@@ -342,11 +336,11 @@ class SignerApp:
         self.count_lbl = self.files_title.winfo_children()[-1]
         btns = ctk.CTkFrame(top, fg_color="transparent")
         btns.grid(row=0, column=1, sticky="e")
-        self.add_files_btn = secondary_button(btns, "+  Add files", self._add_files)
+        self.add_files_btn = secondary_button(btns, "+  Add files", self._add_files, width=104)
         self.add_files_btn.pack(side="left")
-        self.add_folder_btn = secondary_button(btns, "Add folder", self._add_folder)
+        self.add_folder_btn = secondary_button(btns, "Add folder", self._add_folder, width=96)
         self.add_folder_btn.pack(side="left", padx=(8, 0))
-        self.clear_btn = secondary_button(btns, "Clear", self._clear)
+        self.clear_btn = secondary_button(btns, "Clear", self._clear, width=64)
         self.clear_btn.pack(side="left", padx=(8, 0))
 
         self.list = ctk.CTkScrollableFrame(card, fg_color="transparent", corner_radius=0,
@@ -433,6 +427,9 @@ class SignerApp:
         if skipped:
             self._log("Skipped %d file(s) that aren't PDF / .be / .sb / .json." % len(skipped))
 
+    def _pin(self) -> str:
+        return self.pin_entry.get().strip()
+
     def _selected_cert(self) -> Optional[CertInfo]:
         labels = [c.display for c in self.certs]
         if not self.certs:
@@ -455,12 +452,13 @@ class SignerApp:
             self.pill.configure(text="  ●  Token connected  ", text_color=OK)
         else:
             self.pill.configure(text="  ●  Token not connected  ", text_color=MUTED)
-        ready = bool(cert and n and self.pin_var.get().strip()) and not self._busy
+        ready = bool(cert and n and self._pin()) and not self._busy
         if self._busy:
-            self.sign_btn.configure(text="Signing…", state="disabled")
+            self.sign_btn.configure(text="Signing…", state="disabled", fg_color=ROW_HOVER)
         else:
             self.sign_btn.configure(text=("Sign %d file%s" % (n, "" if n == 1 else "s")) if n else "Sign",
-                                    state="normal" if ready else "disabled")
+                                    state="normal" if ready else "disabled",
+                                    fg_color=LIME if ready else ROW_HOVER)
         state = "disabled" if self._busy else "normal"
         for b in (self.add_files_btn, self.add_folder_btn, self.clear_btn, self.connect_btn,
                   self.browse_out_btn):
@@ -532,7 +530,7 @@ class SignerApp:
         self.connect_btn.configure(text="…")
         self._refresh()
         self._log("Reading certificates from the token…")
-        pin = self.pin_var.get().strip() or None
+        pin = self._pin() or None
 
         def work() -> None:
             try:
@@ -603,7 +601,7 @@ class SignerApp:
         if self._busy:
             return
         cert = self._selected_cert()
-        pin = self.pin_var.get().strip()
+        pin = self._pin()
         problem = ("Connect your token first." if not cert
                    else "Add at least one file." if not self.rows
                    else "Enter the token PIN." if not pin else "")
@@ -688,7 +686,7 @@ class SignerApp:
             self._busy = False
             self.connect_btn.configure(text="Connect")
             self._log("ERROR reading the token: " + item[1])
-            self._flash("Couldn't read the token — see Activity.", ERR)
+            self._flash("Couldn't read the token — see Activity log.", ERR)
             self._refresh()
         elif kind == "file":
             _, i, state, detail = item
@@ -718,18 +716,41 @@ class SignerApp:
         self.q.put(("log", msg))
 
     def _write(self, msg: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", datetime.now().strftime("%H:%M:%S  ") + msg + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        line = datetime.now().strftime("%H:%M:%S  ") + msg
+        self._log_lines.append(line)
+        if self._log_box is not None:
+            try:
+                self._log_box.configure(state="normal")
+                self._log_box.insert("end", line + "\n")
+                self._log_box.see("end")
+                self._log_box.configure(state="disabled")
+            except Exception:  # noqa: BLE001 - window was closed
+                self._log_box = None
 
+    def _open_log(self) -> None:
+        if self._log_win is not None and self._log_win.winfo_exists():
+            self._log_win.focus()
+            return
+        win = ctk.CTkToplevel(self.root)
+        win.title("Activity log — " + APP_TITLE)
+        win.geometry("640x380")
+        win.configure(fg_color=BG)
+        win.transient(self.root)
+        box = ctk.CTkTextbox(win, fg_color=CARD, text_color=TEXT, wrap="word", corner_radius=12,
+                             border_width=1, border_color=BORDER,
+                             font=ctk.CTkFont(family="Consolas" if sys.platform == "win32" else "Menlo",
+                                              size=12))
+        box.pack(fill="both", expand=True, padx=14, pady=14)
+        box.insert("end", "\n".join(self._log_lines) + ("\n" if self._log_lines else ""))
+        box.see("end")
+        box.configure(state="disabled")
+        self._log_win, self._log_box = win, box
 
 def main() -> None:
     ctk.set_appearance_mode("system")      # follows Windows light/dark
     ctk.set_default_color_theme("blue")
     root = _Root()
-    app = SignerApp(root)
-    app.pin_var.trace_add("write", lambda *_: app._refresh())
+    SignerApp(root)
     root.mainloop()
 
 

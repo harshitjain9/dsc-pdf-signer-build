@@ -41,7 +41,7 @@ jobs:
         run: |
           try { Set-DisplayResolution -Width 1920 -Height 1080 -Force } catch { Write-Host "resolution unchanged" }
           New-Item -ItemType Directory -Force shots | Out-Null
-          foreach ($m in "light","dark") { foreach ($s in "empty","ready","done") {
+          foreach ($m in "light","dark") { foreach ($s in "empty","ready","done","log") {
             python ci/shot.py $m $s "shots/$m-$s.png"
           } }
       - name: Upload exe artifact
