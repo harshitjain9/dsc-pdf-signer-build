@@ -3,9 +3,11 @@ Broto DSC Signer — a small Windows desktop app to sign files with a Digital
 Signature Certificate on a USB token.
 
 Flow: pick your token's certificate -> add files -> enter the token PIN -> Sign.
-PDFs get an embedded PAdES signature; .be/.sb (and other) flat files get the
-ICEGATE append-format signature (<START-SIGNATURE>/<START-CERTIFICATE>/
-<SIGNER-VERSION>). Everything happens on this machine; nothing is uploaded.
+PDFs get an embedded PAdES signature; .be/.sb flat files get the ICEGATE
+append-format signature (<START-SIGNATURE>/<START-CERTIFICATE>/<SIGNER-VERSION>);
+.json (ICEGATE Open API CACHI01/CACHE01) payloads get a digSign object appended
+as the schema-form third top-level key. Everything happens on this machine;
+nothing is uploaded.
 
 Run from source:  python app.py
 Build a .exe:     see README.md
@@ -70,7 +72,7 @@ class SignerApp:
         self.cert_combo.grid(row=0, column=1, sticky="we", padx=4)
         f3.columnconfigure(1, weight=1)
 
-        ff = ttk.LabelFrame(self.root, text="Files to sign   (PDF → PAdES · .be/.sb → ICEGATE signature)")
+        ff = ttk.LabelFrame(self.root, text="Files to sign   (PDF → PAdES · .be/.sb/.json → ICEGATE signature)")
         ff.pack(fill="both", expand=True, **pad)
         self.listbox = tk.Listbox(ff, selectmode="extended")
         self.listbox.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
@@ -125,14 +127,15 @@ class SignerApp:
     def _add_files(self) -> None:
         self._add(filedialog.askopenfilenames(
             title="Select files to sign",
-            filetypes=[("Signable files", "*.pdf *.be *.sb"), ("PDF", "*.pdf"),
-                       ("Flat files", "*.be *.sb"), ("All files", "*.*")]))
+            filetypes=[("Signable files", "*.pdf *.be *.sb *.json"), ("PDF", "*.pdf"),
+                       ("Flat files", "*.be *.sb"), ("ICEGATE JSON", "*.json"),
+                       ("All files", "*.*")]))
 
     def _add_folder(self) -> None:
-        d = filedialog.askdirectory(title="Select a folder — its PDF/.be/.sb files are added")
+        d = filedialog.askdirectory(title="Select a folder — its PDF/.be/.sb/.json files are added")
         if not d:
             return
-        exts = (".pdf", ".be", ".sb")
+        exts = (".pdf", ".be", ".sb", ".json")
         self._add([os.path.join(d, f) for f in sorted(os.listdir(d))
                    if os.path.isfile(os.path.join(d, f)) and f.lower().endswith(exts)])
 

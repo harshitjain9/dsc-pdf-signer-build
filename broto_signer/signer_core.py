@@ -4,9 +4,12 @@ broto_signer.signer_core — DSC signing over a PKCS#11 USB token (pyHanko).
 No UI here. This module discovers the token's PKCS#11 module, lists the signing
 certificates on it, and signs files:
   * PDF            -> embedded PAdES signature (a normal signed PDF)
+  * .json          -> ICEGATE Open API filing signature: a digSign OBJECT appended
+                      as a third top-level key (the CACHI01/CACHE01 schema form)
   * .be/.sb/other  -> ICEGATE 'Text file' signature: the original content plus
                       appended <START-SIGNATURE>/<START-CERTIFICATE>/<SIGNER-VERSION>
-                      tags (signed value = SHA-1(SHA-256(content)))
+                      tags
+  (JSON and flat file share the same signed value = SHA-1(SHA-256(content)).)
 
 Windows-first — that's where DSC tokens and their drivers live — but the code is
 cross-platform. Everything runs locally; nothing leaves the machine.
@@ -22,6 +25,12 @@ from typing import List, Optional
 # treat this as an audit/log tag (it is NOT part of the signed hash) — confirm on
 # a real upload; change here if ICEGATE ever requires a specific value.
 SIGNER_VERSION = b"V-BROTO_09.2026"
+
+# The digSign.signerVersion for ICEGATE JSON (CACHI01/CACHE01) payloads. Real
+# CHA tools vary the string (Royal Impex "V-ROYAL_09.01.2018", Live Impex "1.0")
+# and both are accepted, so ICEGATE does not appear to validate it — we mirror
+# Live Impex's "1.0", the value that ships in the schema-form digSign object.
+JSON_SIGNER_VERSION = b"1.0"
 
 
 # Common PKCS#11 module paths for the DSC tokens Indian CHAs use.
@@ -202,24 +211,62 @@ class DscSigner:
                 return bytes(certs[0][Attribute.VALUE])
         raise RuntimeError("No certificate found on the token.")
 
+    def _double_hash_sign(self, core: bytes) -> bytes:
+        """The ICEGATE signed value = SHA-1( SHA-256(core) ), RSA-PKCS#1 v1.5.
+
+        Reproduced on the token by feeding the 32-byte SHA-256 digest to
+        CKM_SHA1_RSA_PKCS (the token then SHA-1s that digest and signs the
+        DigestInfo). Confirmed on real Royal Impex (Pantasign) and Live Impex
+        (Capricorn) signed BE/SB flat files AND JSON payloads — same math for both."""
+        import hashlib
+        from pkcs11 import Mechanism
+        inner = hashlib.sha256(core).digest()
+        return self._private_key().sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
+
     def sign_flatfile(self, in_path: str, out_path: str) -> None:
         """ICEGATE 'Text file' signature: original content + appended
         <START-SIGNATURE>/<START-CERTIFICATE>/<SIGNER-VERSION> tag lines. The signed
-        value is SHA-1(SHA-256(content with trailing CR/LF stripped)) — reproduced by
-        signing the 32-byte SHA-256 digest on the token with CKM_SHA1_RSA_PKCS."""
+        value is SHA-1(SHA-256(content with trailing CR/LF stripped))."""
         import base64
-        import hashlib
-        from pkcs11 import Mechanism
         with open(in_path, "rb") as inf:
             content = inf.read()
         core = content.rstrip(b"\r\n")
-        inner = hashlib.sha256(core).digest()
-        signature = self._private_key().sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
+        signature = self._double_hash_sign(core)
         cert_der = self._certificate_der()
         out = core + b"\n"
         out += b"<START-SIGNATURE>" + base64.b64encode(signature) + b"</START-SIGNATURE>\n"
         out += b"<START-CERTIFICATE>" + base64.b64encode(cert_der) + b"</START-CERTIFICATE>\n"
         out += b"<SIGNER-VERSION>" + SIGNER_VERSION + b"</SIGNER-VERSION>"
+        with open(out_path, "wb") as outf:
+            outf.write(out)
+
+    def sign_icegate_json(self, in_path: str, out_path: str) -> None:
+        """ICEGATE Open API JSON (CACHI01/CACHE01) signature — the digSign-OBJECT
+        form the CACHE01/CACHI01 schema defines, as produced by Live Impex
+        (Capricorn DSC) on real Aman Seatrans filings.
+
+        The signed value covers the JSON BODY bytes exactly (the compact
+        ``{"headerField":...,"master":...}`` our serializer emits, trailing CR/LF
+        stripped) with the SAME double hash as the flat file. digSign is then
+        inserted as a proper third top-level key by replacing the body's final
+        ``}`` with ``,"digSign":{...}}`` — yielding valid JSON
+        ``{headerField, master, digSign}``. A verifier reconstructs the signed
+        body as everything up to the ``,"digSign"`` marker plus ``}``."""
+        import base64
+        with open(in_path, "rb") as inf:
+            content = inf.read()
+        body = content.rstrip(b"\r\n")
+        if not body.endswith(b"}"):
+            raise ValueError("JSON payload does not end with '}' — cannot append digSign.")
+        signature = self._double_hash_sign(body)
+        cert_der = self._certificate_der()
+        digsign = (
+            b'{"startSignature":"' + base64.b64encode(signature) + b'",'
+            b'"startCertificate":"' + base64.b64encode(cert_der) + b'",'
+            b'"signerVersion":"' + JSON_SIGNER_VERSION + b'"}'
+        )
+        # Replace the body's closing brace with the digSign key + a fresh close.
+        out = body[:-1] + b',"digSign":' + digsign + b"}"
         with open(out_path, "wb") as outf:
             outf.write(out)
 
@@ -244,6 +291,9 @@ def sign_one(signer: DscSigner, in_path: str, out_dir: str) -> str:
     out_path = output_path_for(in_path, out_dir)
     if in_path.lower().endswith(".pdf"):
         signer.sign_pdf(in_path, out_path)
+    elif in_path.lower().endswith(".json"):
+        # ICEGATE Open API JSON filing → the digSign-object envelope (schema form).
+        signer.sign_icegate_json(in_path, out_path)
     else:
         signer.sign_flatfile(in_path, out_path)
     return out_path

@@ -5,9 +5,13 @@ Certificate (DSC) on a USB token — the same kind of signing ICEGATE's *filesig
 utility does, but able to sign a **whole folder at once**.
 
 Signs **PDFs** (invoices, packing lists, etc.) — each gets an embedded **PAdES**
-signature — **and `.be`/`.sb` flat files**, which get ICEGATE's append-format
-signature (`<START-SIGNATURE>` / `<START-CERTIFICATE>` / `<SIGNER-VERSION>`; the
-signed value is `SHA-1(SHA-256(content))`, matching Royal Impex byte-for-byte).
+signature — **`.be`/`.sb` flat files**, which get ICEGATE's append-format
+signature (`<START-SIGNATURE>` / `<START-CERTIFICATE>` / `<SIGNER-VERSION>`) — and
+**`.json` ICEGATE Open API payloads** (CACHI01/CACHE01), which get a `digSign`
+object appended as the schema-form third top-level key
+(`{headerField, master, digSign}`). All three use the same signed value
+`SHA-1(SHA-256(content))`, matching real CHA tools (Royal Impex, Live Impex)
+byte-for-byte.
 
 Everything runs locally on the user's machine. **Nothing is uploaded.**
 
