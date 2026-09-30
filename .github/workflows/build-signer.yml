@@ -29,26 +29,31 @@ jobs:
           --collect-all pyhanko --collect-all pyhanko_certvalidator
           --collect-all asn1crypto --collect-all pkcs11
           --collect-all customtkinter --collect-all tkinterdnd2 app.py
-      - name: Smoke-test the exe starts and its one-click bridge answers
+      - name: Smoke-test the exe starts (login screen, right version) and keeps the bridge shut until login
         shell: pwsh
         run: |
           $log = Join-Path $env:TEMP "BrotoSigner-error.log"
           if (Test-Path $log) { Remove-Item $log }
+          $want = (Select-String -Path broto_signer/app.py -Pattern '^APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
           $p = Start-Process -FilePath broto_signer/dist/BrotoSigner.exe -PassThru
           Start-Sleep -Seconds 20
           if ($p.HasExited) { if (Test-Path $log) { Get-Content $log }; throw "exe exited early (code $($p.ExitCode))" }
-          $st = Invoke-RestMethod -Uri http://127.0.0.1:47811/status -Headers @{ Origin = "https://brotoai.com" }
-          Write-Host ("bridge status: " + ($st | ConvertTo-Json -Compress))
-          if ($st.app -ne "broto-signer") { throw "bridge did not answer as broto-signer" }
+          # 2.4+: a PC nobody has logged in on opens the Broto login screen; its title carries the version.
+          $win = Get-Process BrotoSigner -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle } | Select-Object -First 1
+          Write-Host ("window title: " + $win.MainWindowTitle)
+          if (-not $win -or -not $win.MainWindowTitle.EndsWith("v$want")) { throw "no Broto Signer v$want window" }
+          # Only Broto users may use the Signer: the one-click bridge stays shut until someone logs in.
+          $answered = $false
           try {
-            Invoke-WebRequest -Uri http://127.0.0.1:47811/status -Headers @{ Origin = "https://evil.example" } -ErrorAction Stop | Out-Null
-            throw "foreign origin was NOT refused"
-          } catch { if ($_.Exception.Response.StatusCode.value__ -ne 403) { throw } ; Write-Host "foreign origin refused (403) - OK" }
+            Invoke-WebRequest -Uri http://127.0.0.1:47811/status -Headers @{ Origin = "https://brotoai.com" } -TimeoutSec 5 -ErrorAction Stop | Out-Null
+            $answered = $true
+          } catch { Write-Host "bridge shut before login - OK" }
+          if ($answered) { throw "the bridge answered before anyone logged in" }
           # A --onefile exe is a launcher + a child process with the same name: stop BOTH.
           Get-Process BrotoSigner -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 2
           if (Get-Process BrotoSigner -ErrorAction SilentlyContinue) { throw "BrotoSigner still running" }
-          Write-Host "exe ran, bridge answered, all copies stopped - OK"
+          Write-Host "exe v$want ran (login screen), bridge shut until login, all copies stopped - OK"
       - name: UI screenshots
         continue-on-error: true
         timeout-minutes: 6
