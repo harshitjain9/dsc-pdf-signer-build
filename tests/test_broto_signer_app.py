@@ -105,7 +105,7 @@ def _screen(files=1, pin="123456", busy=False, status_text="", **remote):
     app.certs = [CERT]
     app._cert_labels = [CERT.display]
     app.cert_choice = _Value(CERT.display)
-    app._saved_pin = None
+    app._pins = {}
     app.pin_entry = _Value(pin)
     app._busy = busy
     app.remote = _Remote(**remote)
@@ -167,3 +167,108 @@ def test_sign_is_off_while_signing():
     screen = _screen(files=1, busy=True, paired=True, online=True)
     assert screen.sign_btn.cget("state") == "disabled"
     assert screen.sign_btn.cget("text") == "Signing…"
+
+
+# ------------------------------------------------------------ remote jobs: the certificate Broto names
+TP_ONE, TP_TWO = "11" * 32, "22" * 32
+ONE = CertInfo(label="", subject="CN=HOLDER ONE", cert_id=b"\x01", common_name="HOLDER ONE", thumbprint=TP_ONE,
+               slot_index=0, module="p11.dll", token="sn:A")
+TWO = CertInfo(label="", subject="CN=HOLDER TWO", cert_id=b"\x01", common_name="HOLDER TWO", thumbprint=TP_TWO,
+               slot_index=1, module="p11.dll", token="sn:B")
+
+
+class _FakeSigner:
+    opened = []
+
+    def __init__(self, module, pin, cert_id=b"", cert_label="", slot_index=0):
+        if pin == "bad":
+            raise RuntimeError("CKR_PIN_INCORRECT")
+        _FakeSigner.opened.append((module, pin, slot_index))
+
+    def sign_flatfile_bytes(self, content):
+        return content + b"<signed>"
+
+    def close(self):
+        pass
+
+
+def _remote_app(monkeypatch, pins, picked=ONE):
+    """A SignerApp with two certificates (two tokens) and the given saved PINs, as the
+    heartbeat thread sees it — no window, fake token driver."""
+    import queue
+    import threading
+    monkeypatch.setattr(signer_app, "list_certificates", lambda module, pin=None, pins=None: [ONE, TWO])
+    monkeypatch.setattr(signer_app, "DscSigner", _FakeSigner)
+    monkeypatch.setattr(signer_app.os.path, "exists", lambda p: p == "p11.dll")
+    _FakeSigner.opened = []
+    app = object.__new__(signer_app.SignerApp)
+    app.q = queue.Queue()
+    app._token_lock = threading.Lock()
+    app._remote_ctx = {
+        "module": "p11.dll", "cert_module": picked.module, "cert_id": picked.cert_id.hex(),
+        "cert_thumbprint": picked.thumbprint, "picked_token": picked.token,
+        "certs": [{"thumbprint": c.thumbprint, "module": c.module, "token": c.token} for c in (ONE, TWO)],
+        "pins": dict(pins),
+    }
+    return app
+
+
+def _flatfile_summary(cert_thumbprint="", cert_holder=""):
+    return {"format": "flatfile", "cert_thumbprint": cert_thumbprint, "cert_holder": cert_holder}
+
+
+def test_a_remote_job_signs_with_the_certificate_broto_names_and_that_tokens_pin(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"}, picked=ONE)
+    out = app._sign_for_remote(b"HREC", _flatfile_summary(TP_TWO, "HOLDER TWO"))
+    assert out == b"HREC<signed>"
+    assert _FakeSigner.opened == [("p11.dll", "2222", 1)]          # token B, with B's own PIN
+
+
+def test_no_saved_pin_for_that_token_refuses_without_trying_another_tokens_pin(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111"}, picked=ONE)
+    with pytest.raises(signer_app.SignError) as ei:
+        app._sign_for_remote(b"HREC", _flatfile_summary(TP_TWO, "HOLDER TWO"))
+    assert ei.value.code == "pin_not_saved" and "HOLDER TWO's certificate" in ei.value.message
+    assert _FakeSigner.opened == []                                 # token B was never logged in to
+
+
+def test_a_certificate_not_on_this_pc_is_refused(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"})
+    with pytest.raises(signer_app.SignError) as ei:
+        app._sign_for_remote(b"HREC", _flatfile_summary("33" * 32, "HOLDER THREE"))
+    assert ei.value.code == "cert_missing" and ei.value.message.startswith("HOLDER THREE's certificate isn't on")
+
+
+def test_without_a_named_certificate_the_picked_one_signs_as_before(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"}, picked=TWO)
+    app._sign_for_remote(b"HREC", _flatfile_summary())
+    assert _FakeSigner.opened == [("p11.dll", "2222", 1)]
+
+
+def test_a_pin_saved_before_the_update_still_signs_with_the_picked_certificate(monkeypatch):
+    app = _remote_app(monkeypatch, {"": "1111"}, picked=ONE)
+    app._sign_for_remote(b"HREC", _flatfile_summary())
+    assert _FakeSigner.opened == [("p11.dll", "1111", 0)]
+
+
+def test_a_rejected_pin_is_forgotten_for_that_token_only(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "bad"})
+    with pytest.raises(signer_app.SignError) as ei:
+        app._sign_for_remote(b"HREC", _flatfile_summary(TP_TWO, "HOLDER TWO"))
+    assert ei.value.code == "wrong_pin"
+    assert app.q.get_nowait() == ("remote", "pin_rejected", "sn:B")
+
+
+def test_broto_hears_which_certificates_have_their_tokens_pin_saved(monkeypatch):
+    screen = _screen(files=0)
+    screen.certs = [ONE, TWO]
+    screen._cert_labels = ["HOLDER ONE", "HOLDER TWO"]
+    screen.cert_choice = _Value("HOLDER ONE")
+    screen._pins = {"sn:A": "1111"}
+    screen._refresh()
+    reported = {c["holder"]: c for c in screen._status_snapshot["certificates"]}
+    assert reported["HOLDER ONE"]["pin_saved"] == "1" and reported["HOLDER TWO"]["pin_saved"] == "0"
+    assert reported["HOLDER TWO"]["token"] and "sn:B" not in str(reported)
+    assert screen._saved_pin == "1111"
+    screen.cert_choice = _Value("HOLDER TWO")
+    assert screen._saved_pin is None                                # B's token has no PIN saved

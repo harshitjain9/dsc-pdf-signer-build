@@ -552,5 +552,64 @@ def test_certificate_report_carries_serial_and_thumbprint():
         "thumbprint": info["thumbprint"],
         "not_after": info["not_after"].isoformat(),
         "label": "DSC",
+        "token": "",
+        "can_sign": "1",
     }
-    assert set(rep) <= {"holder", "issuer", "serial", "thumbprint", "not_after", "label"}   # never key material
+    # never key material, and the token only as a short hash
+    assert set(rep) <= {"holder", "issuer", "serial", "thumbprint", "not_after", "label", "token", "can_sign"}
+
+
+# ------------------------------------------------------------ the certificate of the job's ICEGATE ID
+def test_drain_hands_the_certificate_broto_names_to_the_signer():
+    import hashlib
+    events, seen = [], []
+    job = {"kind": "flatfile", "id": "f2", "filename": "9839487.be", "doc_type": "BE", "job_seq": "9839487",
+           "sha256": hashlib.sha256(HREC).hexdigest(), "content_b64": base64.b64encode(HREC).decode(),
+           "cert_thumbprint": "AB" * 32, "cert_holder": "HOLDER TWO"}
+
+    def sign_fn(content, summary):
+        seen.append(summary)
+        return content.rstrip(b"\r\n") + b"\n<START-SIGNATURE>sig</START-SIGNATURE>"
+
+    link, _cls = _drain_link({"heartbeat": [{"ok": True, "jobs_waiting": 1}],
+                              "next_job": [{"job": job}, {"job": None}]}, events, sign_fn)
+    link._beat()
+    assert seen[0]["cert_thumbprint"] == "ab" * 32 and seen[0]["cert_holder"] == "HOLDER TWO"
+
+
+def test_a_job_without_a_named_certificate_leaves_the_choice_to_the_pc():
+    events, seen = [], []
+    link, _cls = _drain_link({"heartbeat": [{"ok": True, "jobs_waiting": 1}],
+                              "next_job": [{"job": _job()}, {"job": None}]}, events,
+                             lambda c, s: seen.append(s) or b"signed")
+    link._beat()
+    assert seen[0]["cert_thumbprint"] == "" and seen[0]["cert_holder"] == ""
+
+
+# ------------------------------------------------------------ one saved PIN per token
+@pytest.fixture()
+def fake_dpapi(monkeypatch):
+    """Stand-in for Windows DPAPI so the per-token PIN store runs on any OS."""
+    monkeypatch.setattr(secure_store, "pin_saving_supported", lambda: True)
+    monkeypatch.setattr(secure_store, "_protect", lambda data, *a, **k: b"enc:" + data)
+    monkeypatch.setattr(secure_store, "_unprotect", lambda data, *a, **k: data[len(b"enc:"):])
+
+
+def test_pins_are_saved_per_token(fake_dpapi):
+    secure_store.save_pin("1111", "sn:A")
+    secure_store.save_pin("2222", "sn:B")
+    assert secure_store.load_pins() == {"sn:A": "1111", "sn:B": "2222"}
+    raw = json.dumps(secure_store.load_settings())
+    assert "1111" not in raw and "2222" not in raw                       # stored encrypted only
+    secure_store.forget_pin("sn:A")
+    assert secure_store.load_pins() == {"sn:B": "2222"} and secure_store.has_saved_pin()
+    secure_store.forget_pin()                                            # every saved PIN
+    assert secure_store.load_pins() == {} and not secure_store.has_saved_pin()
+
+
+def test_a_pin_saved_before_the_update_is_filed_under_its_token(fake_dpapi):
+    secure_store.save_pin("1111")                                        # how 2.3.3 saved it
+    assert secure_store.load_pins() == {"": "1111"} and secure_store.load_pin() == "1111"
+    assert secure_store.bind_legacy_pin("sn:A") is True
+    assert secure_store.load_pins() == {"sn:A": "1111"} and secure_store.load_pin() is None
+    assert secure_store.bind_legacy_pin("sn:B") is False                 # nothing left to file

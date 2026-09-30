@@ -392,6 +392,10 @@ class RemoteLink:
         try:
             content = base64.b64decode(str(job.get("content_b64") or ""), validate=True)
             summary = describe_job(job, content)             # the guard rail: filing JSON or a job's PDF, nothing else
+            # The certificate of the job's ICEGATE ID (Broto sends it once an admin has
+            # tied certificates to IDs) — sign_fn signs with exactly that one.
+            summary["cert_thumbprint"] = str(job.get("cert_thumbprint") or "").lower()
+            summary["cert_holder"] = str(job.get("cert_holder") or "")
             if self.sign_fn is None:
                 raise SignError("no_signer", "Remote signing isn't available in this build of the Broto Signer.")
             signed = self.sign_fn(content, summary)

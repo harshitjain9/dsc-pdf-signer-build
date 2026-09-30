@@ -20,7 +20,7 @@ import os
 import platform
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # The <SIGNER-VERSION> value stamped into signed flat files. ICEGATE appears to
 # treat this as an audit/log tag (it is NOT part of the signed hash) — confirm on
@@ -28,9 +28,9 @@ from typing import List, Optional
 SIGNER_VERSION = b"V-BROTO_09.2026"
 
 # The digSign.signerVersion for ICEGATE JSON (CACHI01/CACHE01) payloads. Real
-# CHA tools vary the string (Royal Impex "V-ROYAL_09.01.2018", Live Impex "1.0")
-# and both are accepted, so ICEGATE does not appear to validate it — we mirror
-# Live Impex's "1.0", the value that ships in the schema-form digSign object.
+# CHA tools vary the string ("V-ROYAL_09.01.2018" in one, "1.0" in another)
+# and both are accepted, so ICEGATE does not appear to validate it — we use
+# "1.0", the value that ships in the schema-form digSign object.
 JSON_SIGNER_VERSION = b"1.0"
 
 
@@ -98,6 +98,7 @@ class CertInfo:
     thumbprint: str = ""              # sha256 of the DER, hex — what Broto pins a paired PC's DSC by
     can_sign: bool = True             # False = an encryption-only certificate (key usage has no signing bit)
     module: str = ""                  # the PKCS#11 driver it was read through ("" = the app's driver)
+    token: str = ""                   # which token it is on (token_key) — the saved PIN is kept per token
 
     @property
     def display(self) -> str:
@@ -108,7 +109,9 @@ class CertInfo:
 
     def report(self) -> dict:
         """What the signer tells Broto about this certificate when the PC is
-        paired for remote signing (remote.py heartbeat). No key material."""
+        paired for remote signing (remote.py heartbeat). No key material, and
+        the token only as a short hash (never its serial number); the app adds
+        ``pin_saved`` for the token."""
         return {
             "holder": self.common_name or self.subject,
             "issuer": self.issuer,
@@ -116,7 +119,29 @@ class CertInfo:
             "thumbprint": self.thumbprint,
             "not_after": self.not_after.isoformat() if self.not_after else "",
             "label": self.label,
+            "token": token_ref(self.token),
+            "can_sign": "1" if self.can_sign else "0",
         }
+
+
+def token_key(tok, slot_index: int) -> str:
+    """A stable name for a plugged-in token: its serial number (set by the maker,
+    unchanged when it is plugged into another port), else its label and slot.
+    The saved PIN is kept per token under this name."""
+    serial = getattr(tok, "serial", b"") or b""
+    if isinstance(serial, (bytes, bytearray)):
+        serial = bytes(serial).decode("ascii", "replace")
+    serial = str(serial).replace("\x00", "").strip()
+    if serial:
+        return "sn:" + serial
+    label = str(getattr(tok, "label", "") or "").replace("\x00", "").strip()
+    return "slot%d:%s" % (slot_index, label)
+
+
+def token_ref(key: str) -> str:
+    """What Broto is told about a token: a short hash of its key."""
+    import hashlib
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else ""
 
 
 def _describe_cert(der: bytes) -> dict:
@@ -202,11 +227,14 @@ def _read_certificates(session, slot_index: int, module: str) -> List[CertInfo]:
     return out
 
 
-def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
+def list_certificates(module: str, pin: Optional[str] = None,
+                      pins: Optional[Dict[str, str]] = None) -> List[CertInfo]:
     """Enumerate the certificates on every token this driver can see (each
     plugged-in token is a slot). Reads without logging in first — certificates
-    are public on DSC tokens — and uses the PIN only for a token that shows
-    none, or none it could read, that way."""
+    are public on DSC tokens — and logs in only to a token that shows none, or
+    none it could read, that way: with that token's OWN saved PIN (``pins``, by
+    token_key), else with ``pin`` (the PIN just typed). Never another token's
+    saved PIN."""
     import pkcs11
 
     lib = pkcs11.lib(module)
@@ -214,8 +242,10 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
     seen = set()
     for slot_index, slot in enumerate(lib.get_slots(token_present=True)):
         tok = slot.get_token()
+        key = token_key(tok, slot_index)
+        token_pin = (pins or {}).get(key) or pin
         found: List[CertInfo] = []
-        for use_pin in (None, pin):
+        for use_pin in (None, token_pin):
             if use_pin is not None and any(c.thumbprint for c in found):
                 break                                   # already read without the PIN
             try:
@@ -225,8 +255,10 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
                     found = got
             except Exception:
                 pass
-            if pin is None:
+            if token_pin is None:
                 break
+        for c in found:
+            c.token = key
         for n, c in enumerate(found):
             # The same certificate in two slots is listed once; certificates
             # whose details could not be read are never merged with each other.
@@ -238,15 +270,17 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
     return out
 
 
-def list_all_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
+def list_all_certificates(module: str, pin: Optional[str] = None,
+                          pins: Optional[Dict[str, str]] = None) -> List[CertInfo]:
     """Certificates from the chosen driver AND every other known token driver
     on this PC, so a user with two DSC tokens of different makes (say a
     ProxKey and an ePass) sees both and can pick one.
 
-    The PIN goes ONLY to the chosen driver: another make's token is read
-    without logging in, because a PIN meant for one token counts as a wrong
-    try on another — and tokens lock after a few. Signing certificates come
-    first; a certificate seen through two drivers is listed once."""
+    A typed PIN goes ONLY to the chosen driver: another make's token is read
+    without logging in (or with its own saved PIN from ``pins``), because a PIN
+    meant for one token counts as a wrong try on another — and tokens lock
+    after a few. Signing certificates come first; a certificate seen through
+    two drivers is listed once."""
     out: List[CertInfo] = []
     seen = set()
 
@@ -257,12 +291,12 @@ def list_all_certificates(module: str, pin: Optional[str] = None) -> List[CertIn
                 seen.add(key)
                 out.append(c)
 
-    add(list_certificates(module, pin))          # errors here are real — let them surface
+    add(list_certificates(module, pin, pins))    # errors here are real — let them surface
     for other in discover_modules():
         if os.path.normcase(os.path.abspath(other)) == os.path.normcase(os.path.abspath(module)):
             continue
         try:
-            add(list_certificates(other, None))
+            add(list_certificates(other, None, pins))
         except Exception:
             pass                                 # a driver with no token of its own, or one that won't load
     out.sort(key=lambda c: not c.can_sign)       # stable: signing certificates first
@@ -396,8 +430,8 @@ class DscSigner:
 
         Reproduced on the token by feeding the 32-byte SHA-256 digest to
         CKM_SHA1_RSA_PKCS (the token then SHA-1s that digest and signs the
-        DigestInfo). Confirmed on real Royal Impex (Pantasign) and Live Impex
-        (Capricorn) signed BE/SB flat files AND JSON payloads — same math for both."""
+        DigestInfo). Confirmed on real signed BE/SB flat files AND JSON payloads from
+        two other CHA tools (Pantasign and Capricorn DSCs) — same math for both."""
         import hashlib
         from pkcs11 import Mechanism
         inner = hashlib.sha256(core).digest()
@@ -433,8 +467,8 @@ class DscSigner:
 
     def sign_icegate_json_bytes(self, content: bytes) -> bytes:
         """ICEGATE Open API JSON (CACHI01/CACHE01) signature — the digSign-OBJECT
-        form the CACHE01/CACHI01 schema defines, as produced by Live Impex
-        (Capricorn DSC) on real Aman Seatrans filings.
+        form the CACHE01/CACHI01 schema defines, as another CHA tool produces it
+        (Capricorn DSC) on real, accepted filings.
 
         The signed value covers the JSON BODY bytes exactly (the compact
         ``{"headerField":...,"master":...}`` our serializer emits, trailing CR/LF

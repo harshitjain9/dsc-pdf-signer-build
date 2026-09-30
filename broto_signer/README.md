@@ -10,8 +10,7 @@ signature (`<START-SIGNATURE>` / `<START-CERTIFICATE>` / `<SIGNER-VERSION>`) —
 **`.json` ICEGATE Open API payloads** (CACHI01/CACHE01), which get a `digSign`
 object appended as the schema-form third top-level key
 (`{headerField, master, digSign}`). All three use the same signed value
-`SHA-1(SHA-256(content))`, matching real CHA tools (Royal Impex, Live Impex)
-byte-for-byte.
+`SHA-1(SHA-256(content))`, matching real CHA tools byte-for-byte.
 
 Everything runs locally on the user's machine. **Nothing is uploaded.**
 
@@ -58,10 +57,16 @@ send me the message and I'll add the right `--collect`/`--hidden-import`.)
    ProxKey and an ePass at once), and a picker appears. Each entry is unique —
    same-name certificates get their expiry date (then serial) added, and
    encryption-only certificates are marked and listed last. The choice is
-   remembered (by certificate thumbprint) and used for one-click and remote
-   signing too, through that certificate's own driver. The PIN is sent only
-   to the driver chosen in Settings; other tokens are read without logging
-   in, since a PIN meant for one token counts as a wrong try on another.
+   remembered (by certificate thumbprint) and used for one-click signing and
+   for remote jobs Broto doesn't name a certificate for, through that
+   certificate's own driver. A typed PIN is sent only to the driver chosen in
+   Settings; other tokens are read without logging in, since a PIN meant for
+   one token counts as a wrong try on another.
+   **The PIN is saved per token** (by the token's serial number): pick a
+   certificate, type its token's PIN and tick *Remember* — each token keeps its
+   own, and a saved PIN is only ever used on its own token. A PIN saved by an
+   older version is filed under the token of the certificate picked at the
+   first Connect.
 4. **Drag files in** (or a whole folder), or use **Add files / Add folder** →
    optionally **Change…** the destination folder (default: the folder the
    files are in) → **Sign N files**.
@@ -115,8 +120,13 @@ on a PC that has no Broto Signer, Broto emails a one-time code to the firm's
 ICEGATE OTP mailbox; once they type it, this PC picks the job up on its next
 check-in (every 5 seconds while someone is filing, 30 seconds otherwise). It
 checks the payload exactly as the popup does (an unsigned BE/SB filing, nothing
-else), signs with the **saved PIN** and hands the file back — Broto verifies the
-signature and that it came from the certificate this PC reported, then files.
+else), signs and hands the file back — Broto verifies the signature and that it
+came from the right certificate, then files. **Which certificate:** every
+ICEGATE ID has its own DSC. Broto names the certificate set for the job's
+ICEGATE ID (its Filing Licence; set in Broto **Settings ▸ DSC computers**) and
+this PC signs with exactly that one, using the PIN saved for **that
+certificate's token** — never another token's PIN. With no certificate named
+(a PC holding a single one), it signs with the certificate picked here.
 No popup appears here; the header pill counts signatures ("☁ Remote signing on
 · 3 signed") and the **Activity log** records each one with who asked. If the
 PIN is not saved, the token is unplugged, or the token rejects the PIN, the
@@ -142,9 +152,10 @@ What the app stores: the device token Broto issued (Windows: DPAPI-encrypted
 like the PIN, same Windows login only), the firm + PC name, and which Broto
 server it paired with. What it sends on every check-in: the PC's hostname,
 app version, Windows version, token plugged in / PIN saved, and for each
-certificate on the token the holder, issuer, serial, expiry and a SHA-256
-thumbprint — never the PIN and never any key material. The app still never
-talks to ICEGATE.
+certificate on the token the holder, issuer, serial, expiry, a SHA-256
+thumbprint, whether it can sign, which token it is on (a short hash — never the
+token's serial number) and whether that token's PIN is saved — never the PIN
+and never any key material. The app still never talks to ICEGATE.
 
 Development: `BROTO_API_BASE=http://localhost:8000` points pairing + check-ins
 at a local backend (the Settings hint shows the server when it isn't

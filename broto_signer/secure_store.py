@@ -1,5 +1,6 @@
 """
-broto_signer.secure_store — the signer's small settings file + the saved token PIN.
+broto_signer.secure_store — the signer's small settings file + the saved token PINs
+(one per token).
 
 Settings (driver path, which certificate, start-with-Windows) are plain JSON in
 %APPDATA%\\BrotoSigner\\settings.json. The PIN is stored ONLY if the user says
@@ -112,12 +113,42 @@ else:
         raise OSError("PIN saving is only available on Windows.")
 
 
-def save_pin(pin: str) -> None:
-    blob = _protect(pin.encode("utf-8"))
-    update_settings(pin_dpapi=base64.b64encode(blob).decode("ascii"))
+# One PIN per token. A PC can hold several DSC tokens (one per ICEGATE ID), each
+# with its own PIN. A PIN is saved under the token it belongs to (its serial
+# number — signer_core.token_key) and only ever offered to that token: a PIN
+# typed into the wrong token counts as a wrong try, and tokens lock after a few.
+# A PIN saved before 2.3.4 has no token (``pin_dpapi``, key ""); the app binds it
+# to the token of the certificate it was used with the first time it reads them.
+def save_pin(pin: str, token: str = "") -> None:
+    blob = base64.b64encode(_protect(pin.encode("utf-8"))).decode("ascii")
+    if not token:
+        update_settings(pin_dpapi=blob)
+        return
+    pins = dict(load_settings().get("pins_dpapi") or {})
+    pins[token] = blob
+    update_settings(pins_dpapi=pins)
+
+
+def load_pins() -> Dict[str, str]:
+    """Every saved PIN this Windows login can read, by token ("" = saved before
+    2.3.4, token not known yet). A blob another login / PC saved is skipped."""
+    if not pin_saving_supported():
+        return {}
+    data = load_settings()
+    raw = dict(data.get("pins_dpapi") or {})
+    if data.get("pin_dpapi"):
+        raw[""] = data["pin_dpapi"]
+    out: Dict[str, str] = {}
+    for token, b64 in raw.items():
+        try:
+            out[str(token)] = _unprotect(base64.b64decode(b64)).decode("utf-8")
+        except Exception:  # noqa: BLE001 - other user / other PC / corrupt → not saved
+            continue
+    return out
 
 
 def load_pin() -> Optional[str]:
+    """The PIN saved before 2.3.4 (no token)."""
     raw = load_settings().get("pin_dpapi")
     if not raw or not pin_saving_supported():
         return None
@@ -128,11 +159,34 @@ def load_pin() -> Optional[str]:
 
 
 def has_saved_pin() -> bool:
-    return bool(load_settings().get("pin_dpapi"))
+    data = load_settings()
+    return bool(data.get("pin_dpapi") or data.get("pins_dpapi"))
 
 
-def forget_pin() -> None:
-    update_settings(pin_dpapi=None)
+def forget_pin(token: Optional[str] = None) -> None:
+    """Forget one token's saved PIN ("" = the one saved before 2.3.4), or every
+    saved PIN when ``token`` is None."""
+    if token is None:
+        update_settings(pin_dpapi=None, pins_dpapi=None)
+        return
+    if not token:
+        update_settings(pin_dpapi=None)
+        return
+    pins = dict(load_settings().get("pins_dpapi") or {})
+    pins.pop(token, None)
+    update_settings(pins_dpapi=pins or None)
+
+
+def bind_legacy_pin(token: str) -> bool:
+    """File the PIN saved before 2.3.4 (no token) under ``token``. True if moved."""
+    data = load_settings()
+    legacy = data.get("pin_dpapi")
+    if not legacy or not token:
+        return False
+    pins = dict(data.get("pins_dpapi") or {})
+    pins.setdefault(token, legacy)
+    update_settings(pins_dpapi=pins, pin_dpapi=None)
+    return True
 
 
 # ------------------------------------------------------------ remote-signing device token

@@ -36,8 +36,8 @@ def _cert(name, thumb, module="", can_sign=True, serial="", not_after=None, slot
 def test_list_all_certificates_reads_every_driver_but_sends_the_pin_only_to_the_chosen_one(monkeypatch):
     calls = []
 
-    def fake_list(module, pin=None):
-        calls.append((module, pin))
+    def fake_list(module, pin=None, pins=None):
+        calls.append((module, pin, pins))
         if module == "C.dll":
             raise RuntimeError("driver will not load")
         return {
@@ -47,14 +47,15 @@ def test_list_all_certificates_reads_every_driver_but_sends_the_pin_only_to_the_
 
     monkeypatch.setattr(core, "list_certificates", fake_list)
     monkeypatch.setattr(core, "discover_modules", lambda: ["A.dll", "B.dll", "C.dll"])
-    out = core.list_all_certificates("A.dll", "1234")
-    assert calls == [("A.dll", "1234"), ("B.dll", None), ("C.dll", None)]
+    saved = {"sn:B1": "5555"}                                    # each token's own saved PIN may go anywhere
+    out = core.list_all_certificates("A.dll", "1234", saved)
+    assert calls == [("A.dll", "1234", saved), ("B.dll", None, saved), ("C.dll", None, saved)]
     assert [c.thumbprint for c in out] == ["t2", "t3", "t1"]     # signing first, duplicates once
     assert out[1].module == "B.dll"
 
 
 def test_list_all_certificates_surfaces_an_error_from_the_chosen_driver(monkeypatch):
-    def boom(module, pin=None):
+    def boom(module, pin=None, pins=None):
         raise RuntimeError("token not present")
     monkeypatch.setattr(core, "list_certificates", boom)
     monkeypatch.setattr(core, "discover_modules", lambda: [])
@@ -131,23 +132,35 @@ class _FakeSession:
         return iter([_FakeObj(self, a) for a in self.objects])
 
 
-def _fake_pkcs11(monkeypatch, slots):
-    """Install a stand-in ``pkcs11`` module: ``slots`` = one list of cert DERs per plugged-in token."""
+def _fake_pkcs11(monkeypatch, slots, serials=None, hidden=None):
+    """Install a stand-in ``pkcs11`` module: ``slots`` = one list of cert DERs per plugged-in token.
+    ``serials`` gives each token a serial number; ``hidden`` = {slot index: PIN} for a token that
+    shows its certificates only after logging in with that PIN. Returns the PINs each token was
+    opened with, per slot."""
     import types
     mod = types.ModuleType("pkcs11")
     mod.Attribute = types.SimpleNamespace(CLASS="class", LABEL="label", ID="id", VALUE="value")
     mod.ObjectClass = types.SimpleNamespace(CERTIFICATE="cert")
+    opened = {i: [] for i in range(len(slots))}
 
     class _Token:
-        def __init__(self, ders):
-            self.ders = ders
+        def __init__(self, i, ders):
+            self.i, self.ders = i, ders
+            self.serial = ((serials or {}).get(i) or "").encode()
+            self.label = "TOKEN %d" % i
 
         def open(self, user_pin=None):
+            opened[self.i].append(user_pin)
+            need = (hidden or {}).get(self.i)
+            if need is not None and user_pin != need:
+                if user_pin is not None:
+                    raise RuntimeError("CKR_PIN_INCORRECT")
+                return _FakeSession([])
             return _FakeSession([{"label": "", "id": b"\x01", "value": d} for d in self.ders])
 
     class _Slot:
-        def __init__(self, ders):
-            self.token = _Token(ders)
+        def __init__(self, i, ders):
+            self.token = _Token(i, ders)
 
         def get_token(self):
             return self.token
@@ -157,10 +170,11 @@ def _fake_pkcs11(monkeypatch, slots):
             pass
 
         def get_slots(self, token_present=True):
-            return [_Slot(d) for d in slots]
+            return [_Slot(i, d) for i, d in enumerate(slots)]
 
     mod.lib = _Lib
     monkeypatch.setitem(sys.modules, "pkcs11", mod)
+    return opened
 
 
 def _der(cn, issuer, serial):
@@ -179,19 +193,17 @@ def _der(cn, issuer, serial):
 
 
 def test_two_tokens_list_two_certificates_with_their_details(monkeypatch):
-    """The Aman PC case: two DSC tokens (same key ID on both). v2.3.0 read the
-    details after closing the session, so it listed ONE blank 'Certificate in
-    slot 1'."""
+    """A PC with two DSC tokens (same key ID on both). v2.3.0 read the details
+    after closing the session, so it listed ONE blank 'Certificate in slot 1'."""
     import pytest
     pytest.importorskip("asn1crypto")
-    a = _der("MAHESHWARI HITESH NANJIBHAI", "Capricorn Sub CA for Organisation DSC 2022", 0x4E4478D1BD)
-    b = _der("PARMENDER JOGENDER KOCHAR", "Capricorn Sub CA for Individual DSC 2022", 0x3C4A1B0471)
+    a = _der("HOLDER ONE", "Test Sub CA for Organisation DSC", 0x0A0B0C0D01)
+    b = _der("HOLDER TWO", "Test Sub CA for Individual DSC", 0x0A0B0C0D02)
     _fake_pkcs11(monkeypatch, [[a], [b]])
     certs = core.list_certificates("SignatureP11.dll", None)
-    assert [c.common_name for c in certs] == ["MAHESHWARI HITESH NANJIBHAI", "PARMENDER JOGENDER KOCHAR"]
-    assert [c.issuer for c in certs] == ["Capricorn Sub CA for Organisation DSC 2022",
-                                         "Capricorn Sub CA for Individual DSC 2022"]
-    assert [c.serial for c in certs] == ["4E4478D1BD", "3C4A1B0471"]
+    assert [c.common_name for c in certs] == ["HOLDER ONE", "HOLDER TWO"]
+    assert [c.issuer for c in certs] == ["Test Sub CA for Organisation DSC", "Test Sub CA for Individual DSC"]
+    assert [c.serial for c in certs] == ["A0B0C0D01", "A0B0C0D02"]
     assert [c.slot_index for c in certs] == [0, 1]
     assert all(c.thumbprint and c.cert_id == b"\x01" for c in certs)   # Broto pins remote signing on the thumbprint
 
@@ -208,3 +220,52 @@ def test_unreadable_certificates_are_never_merged(monkeypatch):
     _fake_pkcs11(monkeypatch, [[None, None]])       # the token refuses to hand over the certificate bytes
     certs = core.list_certificates("x.dll", None)
     assert len(certs) == 2 and not any(c.thumbprint for c in certs)
+
+
+# ------------------------------------------------------------ one PIN per token
+def test_each_certificate_knows_its_token_and_broto_gets_only_a_hash(monkeypatch):
+    import pytest
+    pytest.importorskip("asn1crypto")
+    a = _der("HOLDER ONE", "Test CA", 11)
+    b = _der("HOLDER TWO", "Test CA", 12)
+    _fake_pkcs11(monkeypatch, [[a], [b]], serials={0: "SERIAL-A", 1: "SERIAL-B"})
+    certs = core.list_certificates("SignatureP11.dll", None)
+    assert [c.token for c in certs] == ["sn:SERIAL-A", "sn:SERIAL-B"]
+    report = certs[0].report()
+    assert report["token"] == core.token_ref("sn:SERIAL-A") and len(report["token"]) == 12
+    assert "SERIAL-A" not in str(report) and report["can_sign"] == "1"
+
+
+def test_a_token_without_a_serial_is_named_by_its_slot():
+    import types
+    assert core.token_key(types.SimpleNamespace(serial=b"   ", label="ePass2003"), 1) == "slot1:ePass2003"
+    assert core.token_key(types.SimpleNamespace(serial=b"0A1B2C\x00\x00", label=""), 0) == "sn:0A1B2C"
+
+
+def test_a_token_that_hides_its_certificates_gets_only_its_own_saved_pin(monkeypatch):
+    """Two tokens, the first shows its certificate only after login. A PIN saved
+    for the second token is never tried on the first — a wrong try counts
+    towards locking it."""
+    import pytest
+    pytest.importorskip("asn1crypto")
+    a = _der("HOLDER ONE", "Test CA", 11)
+    b = _der("HOLDER TWO", "Test CA", 12)
+    opened = _fake_pkcs11(monkeypatch, [[a], [b]], serials={0: "A", 1: "B"}, hidden={0: "1111"})
+
+    certs = core.list_certificates("x.dll", None, pins={"sn:B": "2222"})
+    assert [c.common_name for c in certs] == ["HOLDER TWO"]
+    assert opened == {0: [None], 1: [None]}                 # nobody logged in to token A
+
+    opened[0].clear(), opened[1].clear()
+    certs = core.list_certificates("x.dll", None, pins={"sn:A": "1111", "sn:B": "2222"})
+    assert [c.common_name for c in certs] == ["HOLDER ONE", "HOLDER TWO"]
+    assert opened == {0: [None, "1111"], 1: [None]}         # A with its own PIN; B needed none
+
+
+def test_a_typed_pin_still_opens_a_hiding_token_that_has_no_saved_pin(monkeypatch):
+    import pytest
+    pytest.importorskip("asn1crypto")
+    a = _der("HOLDER ONE", "Test CA", 11)
+    opened = _fake_pkcs11(monkeypatch, [[a]], serials={0: "A"}, hidden={0: "1111"})
+    certs = core.list_certificates("x.dll", "1111")
+    assert [c.common_name for c in certs] == ["HOLDER ONE"] and opened == {0: [None, "1111"]}
