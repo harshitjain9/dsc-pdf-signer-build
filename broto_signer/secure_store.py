@@ -117,7 +117,7 @@ else:
 # with its own PIN. A PIN is saved under the token it belongs to (its serial
 # number — signer_core.token_key) and only ever offered to that token: a PIN
 # typed into the wrong token counts as a wrong try, and tokens lock after a few.
-# A PIN saved before 2.3.4 has no token (``pin_dpapi``, key ""); the app binds it
+# A PIN an older Signer saved has no token (``pin_dpapi``, key ""); the app binds it
 # to the token of the certificate it was used with the first time it reads them.
 def save_pin(pin: str, token: str = "") -> None:
     blob = base64.b64encode(_protect(pin.encode("utf-8"))).decode("ascii")
@@ -130,8 +130,8 @@ def save_pin(pin: str, token: str = "") -> None:
 
 
 def load_pins() -> Dict[str, str]:
-    """Every saved PIN this Windows login can read, by token ("" = saved before
-    2.3.4, token not known yet). A blob another login / PC saved is skipped."""
+    """Every saved PIN this Windows login can read, by token ("" = saved by an
+    older Signer, token not known yet). A blob another login / PC saved is skipped."""
     if not pin_saving_supported():
         return {}
     data = load_settings()
@@ -148,7 +148,7 @@ def load_pins() -> Dict[str, str]:
 
 
 def load_pin() -> Optional[str]:
-    """The PIN saved before 2.3.4 (no token)."""
+    """The PIN an older Signer saved (no token)."""
     raw = load_settings().get("pin_dpapi")
     if not raw or not pin_saving_supported():
         return None
@@ -164,7 +164,7 @@ def has_saved_pin() -> bool:
 
 
 def forget_pin(token: Optional[str] = None) -> None:
-    """Forget one token's saved PIN ("" = the one saved before 2.3.4), or every
+    """Forget one token's saved PIN ("" = the one an older Signer saved), or every
     saved PIN when ``token`` is None."""
     if token is None:
         update_settings(pin_dpapi=None, pins_dpapi=None)
@@ -178,7 +178,7 @@ def forget_pin(token: Optional[str] = None) -> None:
 
 
 def bind_legacy_pin(token: str) -> bool:
-    """File the PIN saved before 2.3.4 (no token) under ``token``. True if moved."""
+    """File the PIN an older Signer saved (no token) under ``token``. True if moved."""
     data = load_settings()
     legacy = data.get("pin_dpapi")
     if not legacy or not token:
@@ -228,6 +228,38 @@ def has_remote_token() -> bool:
 
 def forget_remote_token() -> None:
     update_settings(remote_token_dpapi=None, remote_token_plain=None)
+
+
+# ------------------------------------------------------------ Broto login (account.py)
+# The logged-in user's Broto token. Same protection as the remote token: DPAPI
+# on Windows (same Windows login, same PC), plain text only on dev boxes.
+_SESSION_ENTROPY = b"BrotoSigner/user-session/v1"
+
+
+def save_session_token(token: str) -> None:
+    if remote_token_protected():
+        blob = _protect(token.encode("utf-8"), _SESSION_ENTROPY, "Broto Signer login")
+        update_settings(session_token_dpapi=base64.b64encode(blob).decode("ascii"), session_token_plain=None)
+    else:
+        update_settings(session_token_plain=token, session_token_dpapi=None)
+
+
+def load_session_token() -> Optional[str]:
+    data = load_settings()
+    raw = data.get("session_token_dpapi")
+    if raw:
+        if not remote_token_protected():
+            return None
+        try:
+            return _unprotect(base64.b64decode(raw), _SESSION_ENTROPY).decode("utf-8")
+        except Exception:  # noqa: BLE001 - other user / other PC / corrupt → logged out
+            return None
+    plain = data.get("session_token_plain")
+    return str(plain) if plain else None
+
+
+def forget_session_token() -> None:
+    update_settings(session_token_dpapi=None, session_token_plain=None)
 
 
 # ------------------------------------------------------------ start with Windows

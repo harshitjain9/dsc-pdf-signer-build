@@ -40,7 +40,8 @@ def _load_signer_app():
     except ImportError:
         tk = types.ModuleType("tkinter")
         tk.filedialog = types.ModuleType("tkinter.filedialog")
-        stand_ins.update({"tkinter": tk, "tkinter.filedialog": tk.filedialog})
+        tk.messagebox = types.ModuleType("tkinter.messagebox")
+        stand_ins.update({"tkinter": tk, "tkinter.filedialog": tk.filedialog, "tkinter.messagebox": tk.messagebox})
     spec = importlib.util.spec_from_file_location("broto_signer_app", os.path.join(SIGNER_DIR, "app.py"))
     module = importlib.util.module_from_spec(spec)
     sys.modules.update(stand_ins)
@@ -167,6 +168,54 @@ def test_sign_is_off_while_signing():
     screen = _screen(files=1, busy=True, paired=True, online=True)
     assert screen.sign_btn.cget("state") == "disabled"
     assert screen.sign_btn.cget("text") == "Signing…"
+
+
+# ------------------------------------------------------------ Relaunch to update
+class _Updater:
+    def __init__(self):
+        self.relaunched = False
+        self.stopped = False
+
+    def relaunch(self):
+        self.relaunched = True
+
+    def stop(self):
+        self.stopped = True
+
+
+def _update_screen(busy=False, locked=False):
+    import threading
+
+    app = object.__new__(signer_app.SignerApp)
+    app._busy = busy
+    app._approval = None
+    app._token_lock = threading.Lock()
+    if locked:
+        app._token_lock.acquire()
+    app._quitting = False
+    app.updater = _Updater()
+    app.remote = types.SimpleNamespace(stop=lambda: None)
+    app.bridge = types.SimpleNamespace(stop=lambda: None)
+    app.status_lbl = _Widget()
+    app.root = types.SimpleNamespace(destroyed=False)
+    app.root.destroy = lambda: setattr(app.root, "destroyed", True)
+    app._flash = lambda msg, color: app.status_lbl.configure(text=msg)
+    return app
+
+
+@pytest.mark.parametrize("busy, locked", [(True, False), (False, True)], ids=["batch-signing", "remote-signing"])
+def test_relaunch_waits_while_signing(busy, locked):
+    app = _update_screen(busy=busy, locked=locked)
+    app._relaunch_to_update()
+    assert not app.updater.relaunched and not app.root.destroyed
+    assert "Wait for signing to finish" in app.status_lbl.cget("text")
+
+
+def test_relaunch_stops_everything_then_swaps_and_quits():
+    app = _update_screen()
+    app._relaunch_to_update()
+    assert app.updater.stopped and app.updater.relaunched and app.root.destroyed
+    assert app._token_lock.locked()          # no signature can start while the new copy takes over
 
 
 # ------------------------------------------------------------ remote jobs: the certificate Broto names

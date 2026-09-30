@@ -23,8 +23,9 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Dict, List, Optional
 
 import customtkinter as ctk
@@ -36,22 +37,26 @@ except Exception:  # noqa: BLE001
     TkinterDnD = None
 
 import secure_store as store
+from account import REFRESH_INTERVAL_S, Account, ApiError, login_error_message
 from bridge import BRIDGE_PORT, BridgeServer, SignRequest
-from remote import DEFAULT_API_BASE, RemoteLink, SignError, device_report
+from remote import DEFAULT_API_BASE, RemoteLink, SignError, default_api_base, device_report
 from signer_core import (CertInfo, DscSigner, cert_choice_labels, default_module, discover_module,
                          list_all_certificates, list_certificates, make_batch_folder, pin_error_kind, sign_one)
+from updater import Updater, relaunch_command, spawn
 
 APP_TITLE = "Broto DSC Signer"
-# Bump on every release — the planned self-updater compares this with the
-# server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN;
+# Bump on every release — updater.py compares this with the version Broto
+# published (latest.json) to offer "Relaunch to update". 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN;
 # 2.2 = remote signing (pair this PC with the firm's Broto account); 2.3 = several
 # certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear;
 # 2.3.1 = certificate details read while the token session is open (were blank, and 2 showed as 1);
 # 2.3.2 = the token card scrolls (Settings ▸ Remote signing was cut off) + the Remote signing pill opens it;
 # 2.3.3 = Sign stays clickable on a PC paired for remote signing (the remote-signature count hid the file count);
 # 2.3.4 = a remote job is signed with the certificate of the job's ICEGATE ID (Broto names it), and the PIN is
-#         saved per token — a PIN is never tried on another token.
-APP_VERSION = "2.3.4"
+#         saved per token — a PIN is never tried on another token (published alone for a few minutes, never installed);
+# 2.4.0 = Broto login screen (only Broto users), "Relaunch to update", PDFs pyHanko's strict mode refused now sign;
+# 2.4.1 = 2.4.0 + 2.3.4 (the certificate of the job's ICEGATE ID, one saved PIN per token).
+APP_VERSION = "2.4.1"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -119,6 +124,20 @@ else:
         def __init__(self) -> None:
             super().__init__()
             self.dnd_ok = False
+
+
+def _set_window_icon(root) -> None:
+    ico, png = _resource("assets", "broto.ico"), _resource("assets", "broto.png")
+    try:
+        if sys.platform == "win32" and os.path.exists(ico):
+            # CustomTkinter swaps in its own icon ~200 ms after start; set ours after.
+            root.after(250, lambda: root.iconbitmap(ico))
+        elif os.path.exists(png):
+            import tkinter as tk
+            root._broto_icon = tk.PhotoImage(file=png)
+            root.iconphoto(True, root._broto_icon)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ------------------------------------------------------------------ widgets
@@ -408,10 +427,84 @@ class SavePinDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+# ------------------------------------------------------------------ login
+class LoginScreen:
+    """The first screen: only Broto users may use the Signer (account.py).
+    Nothing else — no bridge, no remote signing — runs until login succeeds."""
+
+    def __init__(self, root: _Root, account: Account, on_done, notice: str = "") -> None:
+        self.root, self.account, self.on_done = root, account, on_done
+        self.q: "queue.Queue" = queue.Queue()
+        self.frame = ctk.CTkFrame(root, fg_color="transparent")
+        self.frame.grid(row=0, column=0, rowspan=3, sticky="nsew")
+        self.frame.grid_columnconfigure(0, weight=1)
+        self.frame.grid_rowconfigure(0, weight=1)
+        self.frame.grid_rowconfigure(2, weight=1)
+        card = Card(self.frame, width=400)
+        card.grid(row=1, column=0)
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="b", width=52, height=52, corner_radius=14, fg_color=(NAVY, LIME),
+                     text_color=("#FFFFFF", NAVY), font=_font(28, "bold")).grid(row=0, column=0, pady=(32, 12))
+        ctk.CTkLabel(card, text="Log in to Broto", text_color=TEXT,
+                     font=_font(22, "bold")).grid(row=1, column=0, padx=40, pady=(0, 20))
+        self.email = ctk.CTkEntry(card, width=320, height=44, corner_radius=10, placeholder_text="Email",
+                                  fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=_font(15))
+        self.email.grid(row=2, column=0, padx=40)
+        self.password = ctk.CTkEntry(card, width=320, height=44, corner_radius=10, placeholder_text="Password",
+                                     show="•", fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=_font(15))
+        self.password.grid(row=3, column=0, padx=40, pady=(10, 0))
+        self.msg = ctk.CTkLabel(card, text=notice, text_color=ERR, font=_font(13), wraplength=320, justify="left")
+        self.msg.grid(row=4, column=0, padx=40, pady=(10, 0), sticky="w")
+        self.btn = ctk.CTkButton(card, text="Log in", width=320, height=46, corner_radius=12, fg_color=LIME,
+                                 hover_color=LIME_HOVER, text_color=NAVY, font=_font(15, "bold"),
+                                 command=self.submit)
+        self.btn.grid(row=5, column=0, padx=40, pady=(12, 36))
+        if account.email:
+            self.email.insert(0, account.email)
+        for w in (self.email, self.password):
+            w.bind("<Return>", lambda _e: self.submit())
+        (self.password if account.email else self.email).focus_set()
+
+    def submit(self) -> None:
+        email, password = self.email.get().strip(), self.password.get()
+        if not email or not password:
+            self.msg.configure(text="Type your email and password.")
+            return
+        self.btn.configure(state="disabled", text="Logging in…")
+        self.msg.configure(text="")
+
+        def work() -> None:
+            try:
+                self.account.login(email, password)
+                self.q.put(None)
+            except ApiError as e:
+                self.q.put(login_error_message(e))
+            except Exception:  # noqa: BLE001
+                self.q.put("Broto could not log you in right now. Try again in a few minutes.")
+        threading.Thread(target=work, name="broto-login", daemon=True).start()
+        self._wait()
+
+    def _wait(self) -> None:
+        try:
+            err = self.q.get_nowait()
+        except queue.Empty:
+            self.root.after(100, self._wait)
+            return
+        if err:
+            self.btn.configure(state="normal", text="Log in")
+            self.msg.configure(text=err)
+            self.password.delete(0, "end")
+            self.password.focus_set()
+            return
+        self.frame.destroy()
+        self.on_done()
+
+
 # ------------------------------------------------------------------ app
 class SignerApp:
-    def __init__(self, root: _Root) -> None:
+    def __init__(self, root: _Root, account: Account) -> None:
         self.root = root
+        self.account = account
         root.title("%s  v%s" % (APP_TITLE, APP_VERSION))
         root.geometry("980x640")
         root.minsize(820, 560)
@@ -434,7 +527,7 @@ class SignerApp:
         self._log_lines: List[str] = []
         self._log_win = None
         self._log_box = None
-        # Saved PINs, one per token (token_key → PIN; "" = saved before 2.3.4, token not known yet).
+        # Saved PINs, one per token (token_key → PIN; "" = saved by an older Signer, token not known yet).
         self._pins: Dict[str, str] = store.load_pins()
         self._asked_save_pin = False
         self._token_lock = threading.Lock()     # one token session at a time (batch vs bridge)
@@ -446,6 +539,9 @@ class SignerApp:
         self.remote = RemoteLink(report_fn=self._remote_report,
                                  notify=lambda ev, payload: self.q.put(("remote", ev, payload)),
                                  sign_fn=self._sign_for_remote)
+        self._quitting = False
+        self.updater = Updater(APP_VERSION, account.api_base, token_fn=lambda: self.account.token,
+                               notify=lambda ev, info: self.q.put(("update", ev, info)))
 
         self._build()
         self.bridge = BridgeServer(on_request=lambda req: self.q.put(("bridge_req", req)),
@@ -453,7 +549,10 @@ class SignerApp:
         self.bridge_ok = self.bridge.start()
         self._refresh()
         self.remote.start()
+        self.updater.start()
+        threading.Thread(target=self._session_loop, name="broto-session", daemon=True).start()
         self._poll()
+        self._log("Logged in as %s." % self.account.label())
         if self.module_var.get() and os.path.exists(self.module_var.get()):
             self._log("Token driver: " + self.module_var.get())
         else:
@@ -476,17 +575,7 @@ class SignerApp:
 
     # ---------------------------------------------------------- chrome
     def _set_icon(self) -> None:
-        ico, png = _resource("assets", "broto.ico"), _resource("assets", "broto.png")
-        try:
-            if sys.platform == "win32" and os.path.exists(ico):
-                # CustomTkinter swaps in its own icon ~200 ms after start; set ours after.
-                self.root.after(250, lambda: self.root.iconbitmap(ico))
-            elif os.path.exists(png):
-                import tkinter as tk
-                self._icon_img = tk.PhotoImage(file=png)
-                self.root.iconphoto(True, self._icon_img)
-        except Exception:  # noqa: BLE001
-            pass
+        _set_window_icon(self.root)
 
     def _build(self) -> None:
         r = self.root
@@ -615,6 +704,12 @@ class SignerApp:
                           font=_font(12), progress_color=(NAVY, LIME), switch_width=36,
                           switch_height=18).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self._build_remote_box(self.driver_box)
+        acct = ctk.CTkFrame(self.driver_box, fg_color="transparent")
+        acct.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        acct.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(acct, text="Logged in as " + self.account.label(), text_color=TEXT, font=_font(12),
+                     anchor="w", justify="left", wraplength=200).grid(row=0, column=0, sticky="ew")
+        secondary_button(acct, "Log out", self._logout, width=84).grid(row=0, column=1, padx=(6, 0))
 
     def _build_remote_box(self, parent) -> None:
         """Settings ▸ Remote signing: pair this PC with the firm's Broto account so
@@ -748,7 +843,7 @@ class SignerApp:
         except Exception as e:  # noqa: BLE001
             kind = pin_error_kind(e)
             if kind == "wrong":
-                # Forget that token's saved PIN on the UI thread ("" = the one saved before 2.3.4).
+                # Forget that token's saved PIN on the UI thread ("" = the one an older Signer saved).
                 self.q.put(("remote", "pin_rejected", (use.token if use is not None else "") or ""))
                 raise SignError("wrong_pin", "The token rejected the PIN saved on this PC, so it was removed — "
                                              "enter the PIN again in the Broto Signer there.")
@@ -892,11 +987,18 @@ class SignerApp:
         self.progress = ctk.CTkProgressBar(right, width=220, height=6, corner_radius=3,
                                            progress_color=(NAVY, LIME), fg_color=BORDER)
         self.progress.set(0)
-        self.sign_btn = ctk.CTkButton(right, text="Sign", width=200, height=46, corner_radius=12,
+        btn_row = self._btn_row = ctk.CTkFrame(right, fg_color="transparent")
+        btn_row.pack(side="top", anchor="e", pady=(4, 0))
+        self.sign_btn = ctk.CTkButton(btn_row, text="Sign", width=200, height=46, corner_radius=12,
                                       fg_color=LIME, hover_color=LIME_HOVER, text_color=NAVY,
                                       text_color_disabled=("#7A8699", "#5A6782"),
                                       font=_font(15, "bold"), command=self._start_sign)
-        self.sign_btn.pack(side="top", anchor="e", pady=(4, 0))
+        self.sign_btn.pack(side="right")
+        # Shown once a newer Signer is downloaded and checked (updater.py).
+        self.update_btn = ctk.CTkButton(btn_row, text="Relaunch to update", width=170, height=46, corner_radius=12,
+                                        fg_color=(NAVY, LIME), hover_color=("#1B3160", LIME_HOVER),
+                                        text_color=("#FFFFFF", NAVY), font=_font(14, "bold"),
+                                        command=self._relaunch_to_update)
 
     # ---------------------------------------------------------- helpers
     def _make_drop_target(self, w) -> None:
@@ -931,7 +1033,7 @@ class SignerApp:
     @property
     def _saved_pin(self) -> Optional[str]:
         """The PIN saved for the token of the certificate picked here. Before the
-        certificates are read (or for a PIN saved before 2.3.4): that old PIN."""
+        certificates are read (or for a PIN an older Signer saved): that old PIN."""
         token = self._selected_token()
         if token and token in self._pins:
             return self._pins[token]
@@ -964,7 +1066,7 @@ class SignerApp:
 
     def _forget_pin(self, reason: str = "", token: Optional[str] = None) -> None:
         """Forget the saved PIN of ``token`` (default: the token of the
-        certificate picked here, and a PIN saved before 2.3.4)."""
+        certificate picked here, and a PIN an older Signer saved)."""
         tokens = [token] if token is not None else [self._selected_token(), ""]
         for t in dict.fromkeys(tokens):
             store.forget_pin(t)
@@ -1150,7 +1252,7 @@ class SignerApp:
         self._refresh()
         self._log("Reading certificates from the token…")
         # A token that shows its certificates only after login gets its own saved PIN,
-        # else the PIN typed here (or one saved before 2.3.4, token not known yet).
+        # else the PIN typed here (or one an older Signer saved, token not known yet).
         pin = self.pin_entry.get().strip() or self._pins.get("") or None
         pins = dict(self._pins)
 
@@ -1258,7 +1360,7 @@ class SignerApp:
         self._busy = True
         self.open_btn.grid_forget()
         self.progress.set(0)
-        self.progress.pack(side="top", anchor="e", pady=(4, 2), before=self.sign_btn)
+        self.progress.pack(side="top", anchor="e", pady=(4, 2), before=self._btn_row)
         self._refresh()
         args = (self._cert_module(cert), cert.cert_id, cert.label, cert.slot_index, pin,
                 [r.path for r in self.rows], dest)
@@ -1329,6 +1431,10 @@ class SignerApp:
         kind = item[0]
         if kind == "log":
             self._write(item[1])
+        elif kind == "update":
+            self._on_update(item[1], item[2])
+        elif kind == "logged_out":
+            self._restart(["--logged-out"])
         elif kind == "certs":
             self._busy = False
             self.connect_btn.configure(text="Connect")
@@ -1343,7 +1449,7 @@ class SignerApp:
                 pick = next((i for i, c in enumerate(self.certs) if want_thumb and c.thumbprint == want_thumb),
                             next((i for i, c in enumerate(self.certs) if want and c.cert_id.hex() == want), 0))
                 self.cert_choice.set(labels[pick])
-                # A PIN saved before 2.3.4 belongs to the token of the certificate it was
+                # A PIN an older Signer saved belongs to the token of the certificate it was
                 # used with — the picked one: file it under that token.
                 token = self.certs[pick].token
                 if "" in self._pins and token and token not in self._pins:
@@ -1509,6 +1615,70 @@ class SignerApp:
         else:
             req.fail("failed", msg[:300])
 
+    # ---------------------------------------------------------- login + updates
+    def _session_loop(self) -> None:
+        """Keep the Broto login fresh (thread). Broto saying no → back to the
+        login screen; no answer → keep going on the current token until it expires."""
+        while not self._quitting:
+            result = self.account.refresh()
+            if result == "logged_out":
+                self.q.put(("logged_out",))
+                return
+            time.sleep(REFRESH_INTERVAL_S if result == "ok" else 300)
+
+    def _on_update(self, event: str, info: dict) -> None:
+        version = str((info or {}).get("version") or "")
+        if event == "ready":
+            self.update_btn.pack(side="right", padx=(0, 10))
+            self._log("Broto Signer %s is ready. Click Relaunch to update." % version)
+        elif event == "available":
+            self._log("Broto Signer %s is out. Download it from the Broto Signer page in Broto." % version)
+
+    def _signing_now(self) -> bool:
+        return self._busy or self._approval is not None or self._token_lock.locked()
+
+    def _relaunch_to_update(self) -> None:
+        if self._signing_now() or not self._token_lock.acquire(blocking=False):
+            self._flash("Wait for signing to finish, then click Relaunch to update.", WARN)
+            return
+        # Hold the token lock from here: no new signature may start while we switch over.
+        self._shutdown_services()
+        try:
+            self.updater.relaunch()
+        except OSError as e:
+            self._token_lock.release()
+            self._log("Update failed: %s" % e)
+            messagebox.showerror(APP_TITLE, "Could not update here.\n"
+                                            "Download the new Broto Signer from the Broto Signer page in Broto.")
+            self._restart([])          # bring the bridge + remote signing back on this version
+            return
+        self.root.destroy()
+
+    def _logout(self) -> None:
+        if not messagebox.askyesno(APP_TITLE, "Log out?\nSigning stops on this computer until someone logs in again."):
+            return
+        self.account.logout()
+        self._restart([])
+
+    def _shutdown_services(self) -> None:
+        """Free the bridge port and stop background work before another copy starts."""
+        self._quitting = True
+        for stop in (self.updater.stop, self.remote.stop, self.bridge.stop):
+            try:
+                stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _restart(self, args: List[str]) -> None:
+        """Start this app again (the login screen when logged out) and quit."""
+        if not self._quitting:
+            self._shutdown_services()
+        try:
+            spawn(relaunch_command(sys.executable, args))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, "Close the Broto Signer and open it again.\n(%s)" % e)
+        self.root.destroy()
+
     def _flash(self, msg: str, color) -> None:
         self.status_lbl.configure(text=msg, text_color=color)
 
@@ -1553,10 +1723,28 @@ def main() -> None:
     ctk.set_appearance_mode("system")      # follows Windows light/dark
     ctk.set_default_color_theme("blue")
     root = _Root()
-    SignerApp(root)
-    if "--minimized" in sys.argv:        # started with Windows — wait quietly for Broto
-        root.after(300, root.iconify)
+    account = Account(default_api_base())
+    if account.logged_in:
+        SignerApp(root, account)
+        if "--minimized" in sys.argv:    # started with Windows — wait quietly for Broto
+            root.after(300, root.iconify)
+    else:
+        # Logged out: always show the window, even when started with Windows.
+        root.title("%s  v%s" % (APP_TITLE, APP_VERSION))
+        root.geometry("980x640")
+        root.minsize(820, 560)
+        root.configure(fg_color=BG)
+        _set_window_icon(root)
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(0, weight=1)
+        notice = "You were logged out. Log in again." if "--logged-out" in sys.argv else ""
+        LoginScreen(root, account, on_done=lambda: _open_app(root, account), notice=notice)
     root.mainloop()
+
+
+def _open_app(root: _Root, account: Account) -> None:
+    root.grid_rowconfigure(0, weight=0)
+    SignerApp(root, account)
 
 
 if __name__ == "__main__":

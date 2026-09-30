@@ -222,6 +222,104 @@ def test_unreadable_certificates_are_never_merged(monkeypatch):
     assert len(certs) == 2 and not any(c.thumbprint for c in certs)
 
 
+# ------------------------------------------------------------ PDFs pyHanko's strict mode refuses
+def _pdf_with_freed_object_in_update() -> bytes:
+    """A one-page PDF plus an incremental update that frees object 5 with a
+    "next generation" of 0 — what Acrobat writes when it drops a dead object on
+    save. pyHanko's strict reader refuses this in any revision after the first
+    (the DGFT licence PDFs of 2026-09-30)."""
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+        b"<< /Length 0 >>\nstream\n\nendstream",
+        b"<< /Unused true >>",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (i, body)
+    xref1 = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref1)
+    xref2 = len(out)
+    out += b"xref\n0 1\n0000000005 65535 f \n5 1\n0000000000 00000 f \n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objs) + 1, xref1, xref2)
+    return bytes(out)
+
+
+def _test_signer():
+    """A pyHanko SimpleSigner with a throwaway self-signed certificate."""
+    import datetime as dt
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography.x509.oid import NameOID
+    from pyhanko.sign import signers
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "TEST HOLDER")])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(1).not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=30)).sign(key, hashes.SHA256()))
+    pfx = pkcs12.serialize_key_and_certificates(b"t", key, cert, None, serialization.NoEncryption())
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".pfx", delete=False) as fh:
+        fh.write(pfx)
+    try:
+        return signers.SimpleSigner.load_pkcs12(fh.name)
+    finally:
+        os.unlink(fh.name)
+
+
+def test_pdf_freed_in_a_later_revision_is_refused_by_strict_pyhanko():
+    """Pins the root cause: strict mode is what threw the user's error."""
+    import io
+
+    import pytest
+    pytest.importorskip("pyhanko")
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.pdf_utils.misc import PdfStrictReadError
+    with pytest.raises(PdfStrictReadError, match="next generation 0"):
+        IncrementalPdfFileWriter(io.BytesIO(_pdf_with_freed_object_in_update()))
+
+
+def test_pdf_freed_in_a_later_revision_signs_and_keeps_its_original_bytes():
+    import pytest
+    pytest.importorskip("pyhanko")
+    pytest.importorskip("cryptography")
+    from pyhanko.sign import signers
+
+    original = _pdf_with_freed_object_in_update()
+    out = signers.sign_pdf(core.open_pdf_for_signing(original),
+                           signers.PdfSignatureMetadata(field_name="BrotoSig"), signer=_test_signer())
+    signed = bytes(out.getbuffer())
+    assert signed.startswith(original)          # an incremental update — Broto checks this
+    import io
+
+    from pyhanko.pdf_utils.reader import PdfFileReader
+    sigs = PdfFileReader(io.BytesIO(signed), strict=False).embedded_signatures
+    assert [s.field_name for s in sigs] == ["BrotoSig"]
+
+
+def test_sign_pdf_bytes_reads_pdfs_non_strict(monkeypatch):
+    """DscSigner.sign_pdf_bytes goes through open_pdf_for_signing (no token needed)."""
+    import pytest
+    pytest.importorskip("pyhanko")
+    pytest.importorskip("cryptography")
+    signer = core.DscSigner.__new__(core.DscSigner)
+    signer._signer = _test_signer()
+    original = _pdf_with_freed_object_in_update()
+    assert signer.sign_pdf_bytes(original).startswith(original)
+
+
 # ------------------------------------------------------------ one PIN per token
 def test_each_certificate_knows_its_token_and_broto_gets_only_a_hash(monkeypatch):
     import pytest

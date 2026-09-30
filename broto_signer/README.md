@@ -43,6 +43,37 @@ The result is **`dist\BrotoSigner.exe`** — a single file you can copy to any
 Windows machine. (First build may miss a hidden import; if it errors at launch,
 send me the message and I'll add the right `--collect`/`--hidden-import`.)
 
+## Log in first (`account.py`)
+The app opens on **Log in to Broto** — the same email and password as
+brotoai.com (`POST /api/cha/auth/login`). Only a Broto user gets past it:
+nothing else runs until then — no signing, no one-click bridge, no remote
+signing. The login is Broto's normal 24-hour token, kept like the saved PIN
+(Windows DPAPI, same Windows login on the same PC) and renewed
+(`/api/cha/auth/refresh`) at start-up and every 4 hours, so an office PC that
+stays on stays logged in. If Broto says no (user removed, token too old) the
+app goes back to the login screen ("You were logged out. Log in again."); if
+Broto just can't be reached, the token keeps working until it expires.
+**Settings ▸ Logged in as … ▸ Log out** logs out (signing stops on that PC).
+The login screen always shows, even when the app starts with Windows.
+
+## Updates — "Relaunch to update" (`updater.py`)
+After login and every 6 hours the app asks Broto for the newest published
+version (`GET /api/cha/signer-devices/app-latest?current=<version>` — the
+server reads `broto-signer/latest.json`, written next to the .exe by
+`scripts/publish_broto_signer.py` / the build workflow: version, SHA-256,
+size). If it is newer, the .exe downloads in the background to
+`BrotoSigner.update.exe` beside the running one and is kept only if its size
+and SHA-256 match. Then **Relaunch to update** appears next to **Sign**. The
+click waits for any signing to finish, stops the bridge and remote signing,
+renames `BrotoSigner.exe` → `BrotoSigner.old.exe` (Windows allows renaming a
+running .exe), puts the new file at the same path (so the start-with-Windows
+entry and shortcuts still work), starts it and quits; any failure puts the old
+file back. The next start deletes `BrotoSigner.old.exe`. Settings, pairing and
+the saved PIN are in `%APPDATA%` and are untouched. Needs PyInstaller ≥ 6.9
+(`PYINSTALLER_RESET_ENVIRONMENT` gives the new copy a fresh start). Run from
+source, the app only logs that a new version is out. **Every release must bump
+`APP_VERSION`** — the check compares it with latest.json.
+
 ## How to use
 1. Plug in the DSC token.
 2. Launch `BrotoSigner.exe`. The default token driver is
@@ -182,6 +213,11 @@ retried, because tokens lock after a few wrong PINs.
   certificate showed as a blank "Certificate in slot 1", two blank ones looked
   identical (only one was listed), and the PC reported no thumbprints — which
   made Broto reject every remote signature. Fixed in v2.3.1 (`_read_certificates`).
+- **pyHanko reads PDFs non-strict** (`open_pdf_for_signing`). Strict mode
+  refused PDFs every viewer opens — e.g. DGFT licence PDFs saved by Acrobat,
+  whose later revision frees a dead object with "next generation 0" ("a free
+  xref with next generation 0 is only permitted in an initial revision",
+  2026-09-30). Fixed in v2.4.0.
 - **Windows-first.** DSC tokens/drivers are effectively Windows-only.
 - **32- vs 64-bit:** if loading the token DLL fails with *"not a valid Win32
   application"*, Python's bitness doesn't match the driver's. `System32` holds

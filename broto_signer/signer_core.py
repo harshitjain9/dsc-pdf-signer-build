@@ -331,6 +331,21 @@ def cert_choice_labels(certs: List[CertInfo]) -> List[str]:
     return labels
 
 
+def open_pdf_for_signing(content: bytes):
+    """pyHanko's incremental writer over ``content``, read in non-strict mode.
+
+    Strict mode refuses PDFs that Acrobat and every viewer open fine — e.g. a
+    later revision that frees a dead object with "next generation 0", which
+    Acrobat writes when it drops objects on save (DGFT licence PDFs, 2026-09-30:
+    "a free xref with next generation 0 is only permitted in an initial
+    revision"). The signature is still an incremental update: the original
+    bytes stay intact."""
+    import io
+
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    return IncrementalPdfFileWriter(io.BytesIO(content), strict=False)
+
+
 class DscSigner:
     """Opens ONE PKCS#11 session (one PIN entry) and signs many files with one
     chosen certificate. Call close() when done."""
@@ -390,13 +405,10 @@ class DscSigner:
         bytes). pyHanko writes an incremental update, so the result starts with
         the original bytes — Broto relies on that to prove the document was not
         altered on the way."""
-        import io
-
         from pyhanko.sign import signers
-        from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
-        writer = IncrementalPdfFileWriter(io.BytesIO(content))
         out = signers.sign_pdf(
-            writer, signers.PdfSignatureMetadata(field_name="BrotoSig"), signer=self._signer)
+            open_pdf_for_signing(content), signers.PdfSignatureMetadata(field_name="BrotoSig"),
+            signer=self._signer)
         return bytes(out.getbuffer())
 
     def _object_templates(self, klass):
