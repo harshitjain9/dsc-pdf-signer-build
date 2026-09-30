@@ -37,12 +37,16 @@ except Exception:  # noqa: BLE001
 
 import secure_store as store
 from bridge import BRIDGE_PORT, BridgeServer, SignRequest
-from signer_core import CertInfo, DscSigner, discover_module, list_certificates, pin_error_kind, sign_one
+from remote import DEFAULT_API_BASE, RemoteLink, SignError, device_report
+from signer_core import (CertInfo, DscSigner, cert_choice_labels, default_module, discover_module,
+                         list_all_certificates, list_certificates, make_batch_folder, pin_error_kind, sign_one)
 
 APP_TITLE = "Broto DSC Signer"
 # Bump on every release — the planned self-updater compares this with the
-# server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN.
-APP_VERSION = "2.1.0"
+# server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN;
+# 2.2 = remote signing (pair this PC with the firm's Broto account); 2.3 = several
+# certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear.
+APP_VERSION = "2.3.0"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -143,6 +147,7 @@ class FileRow(ctk.CTkFrame):
     def __init__(self, master, path: str, on_remove) -> None:
         super().__init__(master, fg_color=ROW, corner_radius=12, height=54)
         self.path = path
+        self.state = "ready"
         ext = os.path.splitext(path)[1].lower()
         label, fg, bg = KIND.get(ext, ("FILE", MUTED, ROW_HOVER))
         self.grid_columnconfigure(1, weight=1)
@@ -164,6 +169,7 @@ class FileRow(ctk.CTkFrame):
         self.remove_btn.grid(row=0, column=3, rowspan=2, padx=(0, 10))
 
     def set_state(self, state: str, detail: str = "") -> None:
+        self.state = state
         if state == "working":
             self.status.configure(text="Signing…", text_color=MUTED)
         elif state == "ok":
@@ -409,11 +415,13 @@ class SignerApp:
 
         self.settings = store.load_settings()
         saved_mod = self.settings.get("module") or ""
-        self.module_var = ctk.StringVar(value=saved_mod if os.path.exists(saved_mod) else (discover_module() or ""))
+        self.module_var = ctk.StringVar(value=saved_mod if os.path.exists(saved_mod) else default_module())
         self.out_var = ctk.StringVar()
+        self._out_auto = ""                      # the destination we filled in ourselves (reset when the list empties)
         self.cert_choice = ctk.StringVar()
         self.rows: List[FileRow] = []
         self.certs: List[CertInfo] = []
+        self._cert_labels: List[str] = []        # unique picker labels, same order as self.certs
         self.q: "queue.Queue" = queue.Queue()
         self._busy = False
         self._driver_open = False
@@ -425,15 +433,22 @@ class SignerApp:
         self._asked_save_pin = False
         self._token_lock = threading.Lock()     # one token session at a time (batch vs bridge)
         self._approval: Optional[ApprovalDialog] = None
-        self._status_snapshot: dict = {}         # read by the bridge thread; written on the UI thread
+        self._status_snapshot: dict = {}         # read by the bridge + remote threads; written on the UI thread
+        # Remote signing (remote.py): pairing state + heartbeat thread. Built before the
+        # UI so Settings can show its state; the thread starts after the first refresh.
+        self._remote_ctx: dict = {}              # driver path + chosen certificate, for signing off-thread
+        self.remote = RemoteLink(report_fn=self._remote_report,
+                                 notify=lambda ev, payload: self.q.put(("remote", ev, payload)),
+                                 sign_fn=self._sign_for_remote)
 
         self._build()
         self.bridge = BridgeServer(on_request=lambda req: self.q.put(("bridge_req", req)),
                                    status=lambda: dict(self._status_snapshot))
         self.bridge_ok = self.bridge.start()
         self._refresh()
+        self.remote.start()
         self._poll()
-        if self.module_var.get():
+        if self.module_var.get() and os.path.exists(self.module_var.get()):
             self._log("Token driver: " + self.module_var.get())
         else:
             self._log("Couldn't find a token driver automatically — open Settings "
@@ -443,9 +458,14 @@ class SignerApp:
             self._log("One-click filing ready — Broto can ask this app for signatures (port %d)." % BRIDGE_PORT)
         else:
             self._log("One-click filing is OFF: " + (self.bridge.error or "could not start"))
+        if self.remote.paired:
+            self._log("Remote signing: paired with %s as %s — checking in with Broto…"
+                      % (self.remote.firm_name or "Broto", self.remote.device_name or "this PC"))
+        else:
+            self._log("Remote signing is off — pair this PC in Settings so your team can sign from anywhere.")
         if store.has_saved_pin() and not self._saved_pin:
             store.forget_pin()   # saved under another Windows login / PC — useless here
-        if self._saved_pin and self.module_var.get():
+        if self._saved_pin and os.path.exists(self.module_var.get()):
             self.root.after(400, self._connect)   # saved PIN → connect straight away
 
     # ---------------------------------------------------------- chrome
@@ -480,6 +500,9 @@ class SignerApp:
                      text_color=MUTED, font=_font(12), anchor="w").grid(row=1, column=1, sticky="nw")
         pills = ctk.CTkFrame(head, fg_color="transparent")
         pills.grid(row=0, column=2, rowspan=2, sticky="e")
+        self.remote_pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
+                                        font=_font(12, "bold"))
+        self.remote_pill.pack(side="left", padx=(0, 8))
         self.bridge_pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
                                         font=_font(12, "bold"))
         self.bridge_pill.pack(side="left", padx=(0, 8))
@@ -575,6 +598,174 @@ class SignerApp:
                           variable=self.autostart_var, command=self._toggle_autostart, text_color=TEXT,
                           font=_font(12), progress_color=(NAVY, LIME), switch_width=36,
                           switch_height=18).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self._build_remote_box(self.driver_box)
+
+    def _build_remote_box(self, parent) -> None:
+        """Settings ▸ Remote signing: pair this PC with the firm's Broto account so
+        staff elsewhere can ask it to sign. The token and the saved PIN stay here."""
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(box, text="Remote signing", text_color=TEXT, font=_font(12, "bold"),
+                     anchor="w").grid(row=0, column=0, columnspan=2, sticky="w")
+        hint = ("Let your team sign from anywhere while this PC stays on with the token plugged in. "
+                "In Broto: Settings ▸ DSC computers ▸ Add computer, then type the code here.")
+        if self.remote.api_base.rstrip("/") != DEFAULT_API_BASE:
+            hint += "  Server: " + self.remote.api_base
+        ctk.CTkLabel(box, text=hint, text_color=MUTED, font=_font(11), anchor="w", justify="left",
+                     wraplength=290).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        self.pair_entry = ctk.CTkEntry(box, height=32, corner_radius=8, placeholder_text="Pairing code, e.g. ABCD-EFGH",
+                                       fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=_font(12))
+        self.pair_entry.bind("<Return>", lambda _e: self._pair_remote())
+        self.pair_btn = secondary_button(box, "Connect", self._pair_remote, width=84)
+        self.remote_lbl = ctk.CTkLabel(box, text="", text_color=TEXT, font=_font(12), anchor="w",
+                                       justify="left", wraplength=200)
+        self.unpair_btn = secondary_button(box, "Disconnect", self._unpair_remote, width=94)
+        self.remote_msg = ctk.CTkLabel(box, text="", text_color=MUTED, font=_font(11), anchor="w",
+                                       justify="left", wraplength=290)
+        self.remote_msg.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._layout_remote()
+
+    def _layout_remote(self) -> None:
+        for w in (self.pair_entry, self.pair_btn, self.remote_lbl, self.unpair_btn):
+            w.grid_forget()
+        if self.remote.paired:
+            st = self.remote.status()
+            self.remote_lbl.configure(text="Connected to %s as %s" % (st.get("firm_name") or "Broto",
+                                                                    st.get("device_name") or "this PC"))
+            self.remote_lbl.grid(row=2, column=0, sticky="ew")
+            self.unpair_btn.grid(row=2, column=1, padx=(6, 0))
+        else:
+            self.pair_entry.grid(row=2, column=0, sticky="ew")
+            self.pair_btn.grid(row=2, column=1, padx=(6, 0))
+
+    def _pair_remote(self) -> None:
+        code = self.pair_entry.get().strip()
+        if len(code.replace("-", "").replace(" ", "")) < 8:
+            self.remote_msg.configure(text="Type the 8-character code shown in Broto.", text_color=ERR)
+            return
+        self.pair_btn.configure(state="disabled", text="Connecting…")
+        self.remote_msg.configure(text="Connecting to Broto…", text_color=MUTED)
+        self._log("Remote signing: pairing this PC with Broto…")
+        self.remote.pair_async(code)
+
+    def _unpair_remote(self) -> None:
+        self.unpair_btn.configure(state="disabled")
+        self.remote_msg.configure(text="Disconnecting…", text_color=MUTED)
+        self.remote.disconnect_async()
+
+    def _remote_report(self) -> dict:
+        """Built on the heartbeat thread from the UI-thread snapshot — never touches Tk."""
+        return device_report(dict(self._status_snapshot), APP_VERSION)
+
+    def _sign_for_remote(self, content: bytes, summary: dict) -> bytes:
+        """Sign for a request relayed by Broto (heartbeat thread — no Tk here).
+        Uses the PIN saved on this PC and the certificate chosen in this app; the
+        token lock serialises it with local signing. Raises SignError with a code
+        Broto shows the person who asked."""
+        ctx = dict(self._remote_ctx)
+        pin = self._saved_pin
+        if not pin:
+            raise SignError("pin_not_saved", "This PC has no saved token PIN. Open the Broto Signer here and tick "
+                                             "“Remember my PIN on this computer”.")
+        module = ctx.get("cert_module") or ctx.get("module") or ""
+        if not module or not os.path.exists(module):
+            raise SignError("driver_missing", "The token driver isn't set on this PC — open the Broto Signer's Settings here.")
+        want, want_thumb = ctx.get("cert_id"), ctx.get("cert_thumbprint")
+        try:
+            with self._token_lock:
+                listed = list_certificates(module, pin)
+                if not listed:
+                    raise SignError("token_missing", "No certificate found on the token — is it plugged into this PC?")
+                match = ([c for c in listed if want_thumb and c.thumbprint == want_thumb]
+                         or [c for c in listed if want and c.cert_id.hex() == want])
+                if match:
+                    use = match[0]
+                elif len(listed) == 1:
+                    use = listed[0]
+                else:
+                    raise SignError("cert_ambiguous", "This token has %d certificates — pick one in the Broto Signer "
+                                                      "on this PC, then try again." % len(listed))
+                signer = DscSigner(module, pin, cert_id=use.cert_id, cert_label=use.label, slot_index=use.slot_index)
+                try:
+                    fmt = (summary or {}).get("format")
+                    if fmt == "pdf":
+                        return signer.sign_pdf_bytes(content)     # PAdES, incremental update
+                    if fmt == "flatfile":
+                        return signer.sign_flatfile_bytes(content)  # ICEGATE tag envelope
+                    return signer.sign_icegate_json_bytes(content)
+                finally:
+                    signer.close()
+        except SignError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            kind = pin_error_kind(e)
+            if kind == "wrong":
+                self.q.put(("remote", "pin_rejected", None))    # forget the saved PIN on the UI thread
+                raise SignError("wrong_pin", "The token rejected the PIN saved on this PC, so it was removed — "
+                                             "enter the PIN again in the Broto Signer there.")
+            if kind == "locked":
+                raise SignError("pin_locked", "The DSC token on this PC is locked. Unlock it with the token's own tool.")
+            raise SignError("failed", (str(e) or repr(e))[:300])
+
+    def _on_remote_event(self, event: str, payload) -> None:
+        if event == "paired":
+            self.pair_btn.configure(state="normal", text="Connect")
+            self.pair_entry.delete(0, "end")
+            self.remote_msg.configure(text="", text_color=MUTED)
+            p = payload if isinstance(payload, dict) else {}
+            self._log("Remote signing ON — paired with %s as %s."
+                      % (p.get("firm_name") or "Broto", p.get("device_name") or "this PC"))
+            self._flash("✓  Remote signing on — your team can ask this PC to sign", OK)
+        elif event == "pair_failed":
+            self.pair_btn.configure(state="normal", text="Connect")
+            self.remote_msg.configure(text=str(payload or "Pairing failed."), text_color=ERR)
+            self._log("Remote signing: pairing failed — " + str(payload))
+        elif event == "online":
+            self.remote_msg.configure(text="", text_color=MUTED)
+            self._log("Remote signing: connected to Broto.")
+        elif event == "offline":
+            self.remote_msg.configure(text="Can't reach Broto right now — retrying. " + str(payload or ""),
+                                      text_color=WARN)
+            self._log("Remote signing: can't reach Broto — " + str(payload))
+        elif event == "revoked":
+            self.unpair_btn.configure(state="normal")
+            self.remote_msg.configure(text=str(payload or "This computer was removed from Broto."),
+                                      text_color=WARN)
+            self._log("Remote signing OFF — " + str(payload))
+            self._flash("Remote signing was switched off from Broto", WARN)
+        elif event == "disconnected":
+            self.unpair_btn.configure(state="normal")
+            self.remote_msg.configure(text="Disconnected. Pair again any time with a new code.", text_color=MUTED)
+            self._log("Remote signing OFF — disconnected from Broto.")
+        elif event == "job_signed":
+            p = payload if isinstance(payload, dict) else {}
+            s, job = p.get("summary") or {}, p.get("job") or {}
+            who = job.get("requested_by") or "a Broto user"
+            what = s.get("kind", "filing")
+            if s.get("format") == "pdf":
+                what = "%s %s" % (what, s.get("filename") or "")
+                tail = "Broto stored the signed copy on the job."
+            elif s.get("format") == "flatfile":
+                what = "%s %s" % (what, s.get("filename") or "")
+                tail = "Broto stored it on the job for download and portal upload."
+            else:
+                tail = "Broto is filing it."
+            self._log("✓ Signed %s for job %s remotely — asked by %s. %s" % (what, s.get("job_number"), who, tail))
+            self._flash("✓  Signed %s (job %s) remotely for %s" % (what, s.get("job_number"), who), OK)
+            if self.root.state() == "iconic":
+                pass                                   # stay out of the way — the log has the details
+        elif event == "job_failed":
+            p = payload if isinstance(payload, dict) else {}
+            s, job = p.get("summary") or {}, p.get("job") or {}
+            self._log("Remote signing request for job %s failed (%s): %s"
+                      % (s.get("job_number") or job.get("job_seq"), p.get("code"), p.get("message")))
+            self._flash("Couldn't sign a remote request — see Activity log", ERR)
+        elif event == "pin_rejected":
+            if self._saved_pin:
+                self._forget_pin("The token rejected the saved PIN during a remote request, so it was removed.")
+        self._layout_remote()
+        self._refresh()
 
     def _build_files_card(self, parent) -> None:
         card = Card(parent)
@@ -638,7 +829,7 @@ class SignerApp:
         out_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(18, 10), pady=(4, 14))
         out_row.grid_columnconfigure(0, weight=1)
         ctk.CTkEntry(out_row, textvariable=self.out_var, height=36, corner_radius=10,
-                     placeholder_text="A 'signed' folder next to your files", fg_color=FIELD,
+                     placeholder_text="The folder your files are in", fg_color=FIELD,
                      border_color=BORDER, text_color=TEXT, font=_font(12)).grid(row=0, column=0, sticky="ew")
         self.browse_out_btn = secondary_button(out_row, "Change…", self._browse_out, width=90)
         self.browse_out_btn.grid(row=0, column=1, padx=(8, 0))
@@ -720,13 +911,16 @@ class SignerApp:
             self._log("Couldn't change the start-up setting: %s" % e)
 
     def _selected_cert(self) -> Optional[CertInfo]:
-        labels = [c.display for c in self.certs]
         if not self.certs:
             return None
         try:
-            return self.certs[labels.index(self.cert_choice.get())]
+            return self.certs[self._cert_labels.index(self.cert_choice.get())]
         except ValueError:
             return self.certs[0]
+
+    def _cert_module(self, cert: Optional[CertInfo]) -> str:
+        """The driver to sign with: the one the chosen certificate was read through."""
+        return (cert.module if cert and cert.module else "") or self.module_var.get().strip()
 
     def _refresh(self) -> None:
         """Re-derive every enabled/disabled state and label from the model."""
@@ -745,11 +939,29 @@ class SignerApp:
             self.bridge_pill.configure(text="  ⚡  One-click filing on  ", text_color=OK)
         else:
             self.bridge_pill.configure(text="  One-click filing off  ", text_color=ERR)
+        rs = self.remote.status()
+        if not rs["paired"]:
+            self.remote_pill.configure(text="  Remote signing off  ", text_color=MUTED)
+        elif rs["online"]:
+            n = int(rs.get("jobs_signed") or 0)
+            self.remote_pill.configure(text="  ☁  Remote signing on%s  " % ("  ·  %d signed" % n if n else ""),
+                                       text_color=OK)
+        elif rs["last_error"]:
+            self.remote_pill.configure(text="  ☁  Remote signing — can't reach Broto  ", text_color=WARN)
+        else:
+            self.remote_pill.configure(text="  ☁  Remote signing — connecting…  ", text_color=MUTED)
         self._status_snapshot = {
             "version": APP_VERSION,
             "token_connected": bool(self.certs),
             "certificate": (cert.common_name or cert.display) if cert else None,
             "pin_saved": bool(self._saved_pin),
+            "certificates": [c.report() for c in self.certs],
+        }
+        self._remote_ctx = {
+            "module": self.module_var.get().strip(),
+            "cert_module": cert.module if cert else self.settings.get("cert_module"),
+            "cert_id": cert.cert_id.hex() if cert else self.settings.get("cert_id"),
+            "cert_thumbprint": cert.thumbprint if cert else self.settings.get("cert_thumbprint"),
         }
         ready = bool(cert and n and self._pin()) and not self._busy
         if self._busy:
@@ -776,14 +988,18 @@ class SignerApp:
         c = self._selected_cert()
         if c:
             self.settings = store.update_settings(cert_id=c.cert_id.hex() or None, cert_label=c.label or None,
-                                                  slot_index=c.slot_index)
+                                                  slot_index=c.slot_index, cert_thumbprint=c.thumbprint or None,
+                                                  cert_module=c.module or None)
         if not c:
             self.cert_name.configure(text="No certificate yet", text_color=MUTED)
             self.cert_issuer.configure(text="Connect to read the certificate on your token.")
             self.cert_expiry.configure(text="")
             return
         self.cert_name.configure(text=c.common_name or c.display, text_color=TEXT)
-        self.cert_issuer.configure(text=("Issued by " + c.issuer) if c.issuer else (c.label or "Certificate on token"))
+        issuer = ("Issued by " + c.issuer) if c.issuer else (c.label or "Certificate on token")
+        if not c.can_sign:
+            issuer += "\nThis certificate is for encryption. Pick your signing certificate above."
+        self.cert_issuer.configure(text=issuer)
         if c.not_after:
             exp = c.not_after if c.not_after.tzinfo else c.not_after.replace(tzinfo=timezone.utc)
             days = (exp - datetime.now(timezone.utc)).days
@@ -838,7 +1054,7 @@ class SignerApp:
 
         def work() -> None:
             try:
-                self.q.put(("certs", list_certificates(mod, pin)))
+                self.q.put(("certs", list_all_certificates(mod, pin)))
             except Exception as e:  # noqa: BLE001 - surface the real error
                 self.q.put(("certs_err", str(e) or repr(e)))
         threading.Thread(target=work, daemon=True).start()
@@ -869,7 +1085,8 @@ class SignerApp:
                 self.rows.append(row)
                 have.add(p)
         if self.rows and not self.out_var.get():
-            self.out_var.set(os.path.join(os.path.dirname(self.rows[0].path), "signed"))
+            self._out_auto = os.path.dirname(self.rows[0].path)
+            self.out_var.set(self._out_auto)
         self._refresh()
 
     def _regrid(self) -> None:
@@ -882,14 +1099,32 @@ class SignerApp:
         self.rows.remove(row)
         row.destroy()
         self._regrid()
-        self._refresh()
+        self._after_rows_removed()
 
     def _clear(self) -> None:
         for row in self.rows:
             row.destroy()
         self.rows.clear()
         self.open_btn.grid_forget()
+        self._after_rows_removed()
+
+    def _after_rows_removed(self) -> None:
+        # List empty and the destination was our own guess → forget it, so the
+        # next files (maybe from another folder) get their own folder.
+        if not self.rows and self._out_auto and self.out_var.get().strip() == self._out_auto:
+            self.out_var.set("")
+            self._out_auto = ""
         self._refresh()
+
+    def _clear_signed(self) -> None:
+        """After a run: take the signed files off the list by themselves; files
+        that failed stay, with their reason, so they can be fixed and signed again."""
+        done = [r for r in self.rows if r.state == "ok"]
+        for row in done:
+            self.rows.remove(row)
+            row.destroy()
+        self._regrid()
+        self._after_rows_removed()
 
     def _browse_out(self) -> None:
         d = filedialog.askdirectory(title="Save signed files to")
@@ -912,8 +1147,10 @@ class SignerApp:
         if problem:
             self._flash(problem, ERR)
             return
-        out_dir = self.out_var.get().strip() or os.path.join(os.path.dirname(self.rows[0].path), "signed")
-        self.out_var.set(out_dir)
+        dest = self.out_var.get().strip() or os.path.dirname(self.rows[0].path)
+        if not self.out_var.get().strip():
+            self._out_auto = dest
+            self.out_var.set(dest)
         for row in self.rows:
             row.set_state("ready")
         self._busy = True
@@ -921,20 +1158,24 @@ class SignerApp:
         self.progress.set(0)
         self.progress.pack(side="top", anchor="e", pady=(4, 2), before=self.sign_btn)
         self._refresh()
-        args = (self.module_var.get().strip(), cert.cert_id, cert.label, cert.slot_index, pin,
-                [r.path for r in self.rows], out_dir)
+        args = (self._cert_module(cert), cert.cert_id, cert.label, cert.slot_index, pin,
+                [r.path for r in self.rows], dest)
         threading.Thread(target=self._sign_worker, args=args, daemon=True).start()
 
-    def _sign_worker(self, module, cert_id, cert_label, slot_index, pin, files, out_dir) -> None:
+    def _sign_worker(self, module, cert_id, cert_label, slot_index, pin, files, dest) -> None:
         with self._token_lock:
-            self._sign_batch(module, cert_id, cert_label, slot_index, pin, files, out_dir)
+            self._sign_batch(module, cert_id, cert_label, slot_index, pin, files, dest)
 
-    def _sign_batch(self, module, cert_id, cert_label, slot_index, pin, files, out_dir) -> None:
+    def _sign_batch(self, module, cert_id, cert_label, slot_index, pin, files, dest) -> None:
         ok = fail = 0
         signer = None
+        out_dir = ""
         try:
             self._log("Opening token session…")
             signer = DscSigner(module, pin, cert_id=cert_id, cert_label=cert_label, slot_index=slot_index)
+            # A NEW folder inside the destination for this run — made only once the
+            # token has opened, so a wrong PIN leaves no empty folder behind.
+            out_dir = make_batch_folder(dest)
             for i, p in enumerate(files):
                 self.q.put(("file", i, "working", ""))
                 try:
@@ -954,7 +1195,13 @@ class SignerApp:
         finally:
             if signer:
                 signer.close()
-        self._log("Done — %d signed, %d failed. Saved to %s" % (ok, fail, out_dir))
+        if out_dir and not ok:
+            try:
+                os.rmdir(out_dir)                # nothing signed → don't leave an empty folder
+            except OSError:
+                pass
+            out_dir = ""
+        self._log("Done — %d signed, %d failed.%s" % (ok, fail, (" Saved to " + out_dir) if out_dir else ""))
         self.q.put(("done", ok, fail, out_dir, pin))
 
     # ---------------------------------------------------------- queue / log
@@ -988,10 +1235,11 @@ class SignerApp:
                 self._log("No certificates found. Is the token plugged in? Some tokens need the PIN first.")
                 self._flash("No certificate found on the token.", ERR)
             else:
-                labels = [c.display for c in self.certs]
+                labels = self._cert_labels = cert_choice_labels(self.certs)
                 self.cert_menu.configure(values=labels)
-                want = self.settings.get("cert_id")
-                pick = next((i for i, c in enumerate(self.certs) if want and c.cert_id.hex() == want), 0)
+                want, want_thumb = self.settings.get("cert_id"), self.settings.get("cert_thumbprint")
+                pick = next((i for i, c in enumerate(self.certs) if want_thumb and c.thumbprint == want_thumb),
+                            next((i for i, c in enumerate(self.certs) if want and c.cert_id.hex() == want), 0))
                 self.cert_choice.set(labels[pick])
                 self.settings = store.update_settings(module=self.module_var.get().strip())
                 if len(self.certs) > 1:
@@ -1007,6 +1255,9 @@ class SignerApp:
             self._busy = False
             self.connect_btn.configure(text="Connect")
             self._log("ERROR reading the token: " + item[1])
+            self.certs, self._cert_labels = [], []
+            self.cert_menu.grid_forget()
+            self._show_cert()
             self._flash("Couldn't read the token — see Activity log.", ERR)
             self._refresh()
         elif kind == "file":
@@ -1031,17 +1282,24 @@ class SignerApp:
             self._bridge_done(*item[1:])
         elif kind == "bridge_err":
             self._bridge_err(*item[1:])
+        elif kind == "remote":
+            self._on_remote_event(item[1], item[2])
         elif kind == "done":
             _, ok, fail, out_dir, pin = item
             self._busy = False
-            self._last_out = out_dir
+            self._last_out = out_dir or None
             self.progress.pack_forget()
+            if ok:
+                self._clear_signed()             # signed files leave the list by themselves
             self._refresh()
+            folder = os.path.basename(out_dir) if out_dir else ""
             if fail == 0 and ok:
-                self._flash("✓  %d file%s signed" % (ok, "" if ok == 1 else "s"), OK)
-            elif ok or fail:
-                self._flash("%d signed · %d failed" % (ok, fail), ERR if not ok else WARN)
-            if ok and os.path.isdir(out_dir):
+                self._flash("✓  %d file%s signed — in folder \"%s\"" % (ok, "" if ok == 1 else "s", folder), OK)
+            elif ok:
+                self._flash("%d signed · %d failed — signed ones in folder \"%s\"" % (ok, fail, folder), WARN)
+            elif any(r.state == "fail" for r in self.rows):   # else keep the token error (e.g. wrong PIN)
+                self._flash("%d failed — see the reason next to each file" % fail, ERR)
+            if ok and out_dir and os.path.isdir(out_dir):
                 self.open_btn.grid(row=0, column=2, padx=(8, 0))
             if ok:
                 self._maybe_offer_save_pin(pin)
@@ -1068,8 +1326,8 @@ class SignerApp:
 
     def _start_bridge_sign(self, req: SignRequest, pin: str, from_saved: bool, remember: bool) -> None:
         cert = self._selected_cert()
-        module = self.module_var.get().strip()
-        want = self.settings.get("cert_id")
+        module = self._cert_module(cert)
+        want, want_thumb = self.settings.get("cert_id"), self.settings.get("cert_thumbprint")
 
         def work() -> None:
             try:
@@ -1081,7 +1339,8 @@ class SignerApp:
                         listed = list_certificates(module, pin)
                         if not listed:
                             raise RuntimeError("No certificate found on the token. Is it plugged in?")
-                        match = [c for c in listed if want and c.cert_id.hex() == want]
+                        match = ([c for c in listed if want_thumb and c.thumbprint == want_thumb]
+                                 or [c for c in listed if want and c.cert_id.hex() == want])
                         if match:
                             use = match[0]
                         elif len(listed) == 1:

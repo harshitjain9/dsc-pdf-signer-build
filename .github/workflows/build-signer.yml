@@ -20,7 +20,7 @@ jobs:
       - name: Bridge + settings tests (incl. Windows DPAPI PIN round-trip)
         run: |
           pip install pytest
-          python -m pytest tests/test_broto_signer_bridge.py -q
+          python -m pytest tests/test_broto_signer_bridge.py tests/test_broto_signer_core.py tests/test_broto_signer_remote.py -q
       - name: Build BrotoSigner.exe
         working-directory: broto_signer
         run: >

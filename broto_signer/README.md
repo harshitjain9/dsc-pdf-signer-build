@@ -46,16 +46,31 @@ send me the message and I'll add the right `--collect`/`--hidden-import`.)
 
 ## How to use
 1. Plug in the DSC token.
-2. Launch `BrotoSigner.exe`. It auto-detects the token driver; if it can't,
-   **Settings** opens so you can pick the PKCS#11 DLL
-   (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
+2. Launch `BrotoSigner.exe`. The default token driver is
+   `C:\Windows\System32\SignatureP11.dll`; if another known driver is
+   installed instead it is picked up automatically, and **Settings** lets you
+   pick any PKCS#11 DLL (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
 3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
    name, the issuing CA and the expiry date (amber inside 30 days, red once
-   expired). Tokens with several certificates get a picker.
+   expired).
+   **More than one certificate?** Connect reads every certificate on the token
+   AND on any other DSC token plugged in whose driver is installed (e.g. a
+   ProxKey and an ePass at once), and a picker appears. Each entry is unique —
+   same-name certificates get their expiry date (then serial) added, and
+   encryption-only certificates are marked and listed last. The choice is
+   remembered (by certificate thumbprint) and used for one-click and remote
+   signing too, through that certificate's own driver. The PIN is sent only
+   to the driver chosen in Settings; other tokens are read without logging
+   in, since a PIN meant for one token counts as a wrong try on another.
 4. **Drag files in** (or a whole folder), or use **Add files / Add folder** →
-   optionally **Change…** the output folder → **Sign N files**.
-5. Each file row turns green (✓ with the signed file's name) or red (with the
-   reason). **Open folder** jumps to the signed files; **Activity** keeps the log.
+   optionally **Change…** the destination folder (default: the folder the
+   files are in) → **Sign N files**.
+5. Every run creates a **new folder inside the destination** —
+   `Broto Signed 30-09-2026 14.05` (or `… (2)` if that name is taken) — and
+   puts all its signed files there. Signed files **leave the list by
+   themselves**; a file that failed stays, in red with the reason, so it can
+   be fixed and signed again. **Open folder** jumps to the new folder;
+   **Activity** keeps the log.
 
 The UI is CustomTkinter and follows the Windows light/dark setting.
 
@@ -78,6 +93,63 @@ can't claim the port, so its pill says off.
 
 **Settings → Open when Windows starts** adds a current-user Run entry that
 launches the app minimised at login, so it's ready when Broto asks.
+
+## Remote signing — pair this PC with Broto (`remote.py`)
+One-click filing needs the browser on the *same* PC as the token. Remote
+signing lifts that: the DSC token stays plugged into one always-on office PC,
+and staff working anywhere can (next step) ask Broto to have **this** PC sign.
+This release ships the trust link — pairing + a heartbeat — which is also what
+Broto's **Settings ▸ DSC computers** list reads.
+
+1. In Broto (an admin): **Settings ▸ DSC computers ▸ Add computer**. Broto shows
+   a one-time code like `ABCD-EFGH`, valid for 10 minutes.
+2. On this PC: **Settings ▸ Remote signing**, type the code, **Connect**. The
+   header pill turns **☁ Remote signing on** and Broto's list shows this PC
+   with the certificate holder, whether the token is plugged in, whether the
+   PIN is saved, and online/offline (a check-in every 30 seconds).
+3. **Disconnect** here, or **Remove** in Broto, ends it. A removed PC learns so
+   on its next check-in and forgets its token.
+
+**Signing for someone else.** When a colleague clicks **Sign & file on ICEGATE**
+on a PC that has no Broto Signer, Broto emails a one-time code to the firm's
+ICEGATE OTP mailbox; once they type it, this PC picks the job up on its next
+check-in (every 5 seconds while someone is filing, 30 seconds otherwise). It
+checks the payload exactly as the popup does (an unsigned BE/SB filing, nothing
+else), signs with the **saved PIN** and hands the file back — Broto verifies the
+signature and that it came from the certificate this PC reported, then files.
+No popup appears here; the header pill counts signatures ("☁ Remote signing on
+· 3 signed") and the **Activity log** records each one with who asked. If the
+PIN is not saved, the token is unplugged, or the token rejects the PIN, the
+request fails with that reason on the requester's screen (a rejected saved PIN
+is removed here and never retried).
+
+The same lane signs a job's **supporting-document PDFs for eSANCHIT** (Sup Doc
+▸ "No token here? Sign these PDFs on <this PC>"): each PDF arrives with the
+fingerprint Broto announced, is checked to be a PDF under 25 MB that matches
+it, gets a PAdES signature (an incremental update — the original bytes stay
+intact), and Broto stores the signed copy on the job. No PDF/A conversion
+happens here.
+
+And the **.be / .sb flat files** (the flat-file step ▸ "Sign .be on <this
+PC>"): Broto generates the file through the download's own checks and hands it
+over; this PC checks the ICEGATE HREC header (a BE or SB message, not already
+signed, under 10 MB, matching fingerprint), appends the
+`<START-SIGNATURE>` / `<START-CERTIFICATE>` / `<SIGNER-VERSION>` envelope exactly
+as batch signing does, and Broto keeps the signed file on the job for the user
+to download and upload on the ICEGATE portal.
+
+What the app stores: the device token Broto issued (Windows: DPAPI-encrypted
+like the PIN, same Windows login only), the firm + PC name, and which Broto
+server it paired with. What it sends on every check-in: the PC's hostname,
+app version, Windows version, token plugged in / PIN saved, and for each
+certificate on the token the holder, issuer, serial, expiry and a SHA-256
+thumbprint — never the PIN and never any key material. The app still never
+talks to ICEGATE.
+
+Development: `BROTO_API_BASE=http://localhost:8000` points pairing + check-ins
+at a local backend (the Settings hint shows the server when it isn't
+production). Off Windows the device token is kept in plain text in
+`settings.json` — dev boxes only; real tokens live on Windows.
 
 ## Saved PIN (optional, Windows only)
 After a PIN has **just worked** (a successful batch, or a one-click signature),

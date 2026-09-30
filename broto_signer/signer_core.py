@@ -34,12 +34,16 @@ SIGNER_VERSION = b"V-BROTO_09.2026"
 JSON_SIGNER_VERSION = b"1.0"
 
 
+# The default token driver (ProxKey / mToken SignatureP11) — what the app
+# offers when nothing was saved and auto-detect finds nothing.
+DEFAULT_WINDOWS_MODULE = r"C:\Windows\System32\SignatureP11.dll"
+
 # Common PKCS#11 module paths for the DSC tokens Indian CHAs use.
 _WINDOWS_MODULES = [
-    r"C:\Windows\System32\eps2003csp11v2.dll",       # ePass2003 (Watchdata) — most common
+    DEFAULT_WINDOWS_MODULE,                           # ProxKey / mToken — the default
+    r"C:\Windows\System32\eps2003csp11v2.dll",       # ePass2003 (Watchdata)
     r"C:\Windows\System32\eps2003csp11.dll",
     r"C:\Windows\System32\wdpkcs.dll",               # Watchdata ProxKey
-    r"C:\Windows\System32\SignatureP11.dll",         # ProxKey / mToken (some builds)
     r"C:\Windows\System32\eTPKCS11.dll",             # SafeNet / Aladdin eToken
     r"C:\Windows\System32\ShuttleCsp11_3003.dll",    # TrustKey / mToken CryptoID
     r"C:\Windows\System32\AKChiptokenInterface_3003.dll",
@@ -57,14 +61,28 @@ _LINUX_MODULES = [
 ]
 
 
+def _candidate_modules() -> List[str]:
+    return {"Windows": _WINDOWS_MODULES, "Darwin": _MAC_MODULES}.get(platform.system(), _LINUX_MODULES)
+
+
+def discover_modules() -> List[str]:
+    """Every known PKCS#11 module present on this machine, default first."""
+    return [p for p in _candidate_modules() if os.path.exists(p)]
+
+
 def discover_module() -> Optional[str]:
     """Return the first known PKCS#11 module present on this machine, or None."""
-    sysname = platform.system()
-    candidates = {"Windows": _WINDOWS_MODULES, "Darwin": _MAC_MODULES}.get(sysname, _LINUX_MODULES)
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
+    found = discover_modules()
+    return found[0] if found else None
+
+
+def default_module() -> str:
+    """The driver path the app starts with when none is saved: the first one
+    found on this PC, else (on Windows) SignatureP11.dll, else ""."""
+    found = discover_module()
+    if found:
+        return found
+    return DEFAULT_WINDOWS_MODULE if platform.system() == "Windows" else ""
 
 
 @dataclass
@@ -76,6 +94,10 @@ class CertInfo:
     common_name: str = ""             # holder name (subject CN)
     issuer: str = ""                  # issuing CA (issuer CN / O)
     not_after: Optional[datetime] = None   # expiry (UTC)
+    serial: str = ""                  # certificate serial (hex) — what a CA / ICEGATE identifies it by
+    thumbprint: str = ""              # sha256 of the DER, hex — what Broto pins a paired PC's DSC by
+    can_sign: bool = True             # False = an encryption-only certificate (key usage has no signing bit)
+    module: str = ""                  # the PKCS#11 driver it was read through ("" = the app's driver)
 
     @property
     def display(self) -> str:
@@ -84,17 +106,41 @@ class CertInfo:
             return "%s — %s" % (name, self.label)
         return name or self.label or "Certificate in slot %d" % (self.slot_index + 1)
 
+    def report(self) -> dict:
+        """What the signer tells Broto about this certificate when the PC is
+        paired for remote signing (remote.py heartbeat). No key material."""
+        return {
+            "holder": self.common_name or self.subject,
+            "issuer": self.issuer,
+            "serial": self.serial,
+            "thumbprint": self.thumbprint,
+            "not_after": self.not_after.isoformat() if self.not_after else "",
+            "label": self.label,
+        }
+
 
 def _describe_cert(der: bytes) -> dict:
-    """Best-effort holder / issuer / expiry from a DER certificate. Each field is
-    read on its own: Indian DSCs carry unusual subject attributes that can make
-    one accessor fail while the others still work."""
+    """Best-effort holder / issuer / expiry / serial / thumbprint from a DER
+    certificate. Each field is read on its own: Indian DSCs carry unusual
+    subject attributes that can make one accessor fail while the others still
+    work."""
+    import hashlib
+
     from asn1crypto import x509
-    out = {"subject": "", "common_name": "", "issuer": "", "not_after": None}
+    out = {"subject": "", "common_name": "", "issuer": "", "not_after": None, "serial": "", "thumbprint": "",
+           "can_sign": True}
+    try:
+        out["thumbprint"] = hashlib.sha256(der).hexdigest()
+    except Exception:
+        pass
     try:
         cert = x509.Certificate.load(der)
     except Exception:
         return out
+    try:
+        out["serial"] = "%X" % cert.serial_number
+    except Exception:
+        pass
     try:
         out["subject"] = cert.subject.human_friendly
     except Exception:
@@ -110,6 +156,13 @@ def _describe_cert(der: bytes) -> dict:
         pass
     try:
         out["not_after"] = cert.not_valid_after
+    except Exception:
+        pass
+    try:
+        usage = cert.key_usage_value
+        if usage is not None:
+            bits = set(usage.native)
+            out["can_sign"] = bool(bits & {"digital_signature", "non_repudiation"})
     except Exception:
         pass
     return out
@@ -148,7 +201,8 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
                 cert_id = bytes(cert[Attribute.ID])
             except Exception:
                 pass
-            info = {"subject": "", "common_name": "", "issuer": "", "not_after": None}
+            info = {"subject": "", "common_name": "", "issuer": "", "not_after": None, "serial": "", "thumbprint": "",
+                    "can_sign": True}
             try:
                 info = _describe_cert(bytes(cert[Attribute.VALUE]))
             except Exception:
@@ -157,8 +211,67 @@ def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
             if key in seen:
                 continue
             seen.add(key)
-            out.append(CertInfo(label=label or "", cert_id=cert_id, slot_index=slot_index, **info))
+            out.append(CertInfo(label=label or "", cert_id=cert_id, slot_index=slot_index, module=module, **info))
     return out
+
+
+def list_all_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
+    """Certificates from the chosen driver AND every other known token driver
+    on this PC, so a user with two DSC tokens of different makes (say a
+    ProxKey and an ePass) sees both and can pick one.
+
+    The PIN goes ONLY to the chosen driver: another make's token is read
+    without logging in, because a PIN meant for one token counts as a wrong
+    try on another — and tokens lock after a few. Signing certificates come
+    first; a certificate seen through two drivers is listed once."""
+    out: List[CertInfo] = []
+    seen = set()
+
+    def add(certs: List[CertInfo]) -> None:
+        for c in certs:
+            key = c.thumbprint or (c.module, c.slot_index, c.cert_id, c.label, c.subject)
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+
+    add(list_certificates(module, pin))          # errors here are real — let them surface
+    for other in discover_modules():
+        if os.path.normcase(os.path.abspath(other)) == os.path.normcase(os.path.abspath(module)):
+            continue
+        try:
+            add(list_certificates(other, None))
+        except Exception:
+            pass                                 # a driver with no token of its own, or one that won't load
+    out.sort(key=lambda c: not c.can_sign)       # stable: signing certificates first
+    return out
+
+
+def cert_choice_labels(certs: List[CertInfo]) -> List[str]:
+    """One label per certificate for the picker — always unique, so picking
+    the second of two same-name certificates (a renewed DSC, or the signing +
+    encryption pair many Indian tokens carry) really selects the second."""
+    def when(c: CertInfo) -> str:
+        return c.not_after.strftime("%d %b %Y") if c.not_after else ""
+
+    labels = []
+    for c in certs:
+        text = c.common_name or c.display
+        if not c.can_sign:
+            text += "  (encryption only)"
+        labels.append(text)
+    # Each pass counts from a snapshot, so every clashing label gets the extra part.
+    snap = list(labels)                          # same name → add the expiry date
+    labels = [("%s  ·  valid till %s" % (lab, when(c))) if snap.count(lab) > 1 and when(c) else lab
+              for lab, c in zip(snap, certs)]
+    snap = list(labels)                          # still the same → add the serial's tail
+    labels = [("%s  ·  no. …%s" % (lab, c.serial[-6:])) if snap.count(lab) > 1 and c.serial else lab
+              for lab, c in zip(snap, certs)]
+    snap, seen = list(labels), {}                # last resort: number them
+    for i, lab in enumerate(snap):
+        if snap.count(lab) > 1:
+            seen[lab] = seen.get(lab, 0) + 1
+            labels[i] = "%s  (%d)" % (lab, seen[lab])
+    return labels
 
 
 class DscSigner:
@@ -210,14 +323,24 @@ class DscSigner:
             self._signer = PKCS11Signer(self._session)
 
     def sign_pdf(self, in_path: str, out_path: str) -> None:
+        with open(in_path, "rb") as inf:
+            signed = self.sign_pdf_bytes(inf.read())
+        with open(out_path, "wb") as outf:
+            outf.write(signed)
+
+    def sign_pdf_bytes(self, content: bytes) -> bytes:
+        """PAdES-sign a PDF held in memory (the remote lane hands PDFs over as
+        bytes). pyHanko writes an incremental update, so the result starts with
+        the original bytes — Broto relies on that to prove the document was not
+        altered on the way."""
+        import io
+
         from pyhanko.sign import signers
         from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
-        with open(in_path, "rb") as inf:
-            writer = IncrementalPdfFileWriter(inf)
-            out = signers.sign_pdf(
-                writer, signers.PdfSignatureMetadata(field_name="BrotoSig"), signer=self._signer)
-        with open(out_path, "wb") as outf:
-            outf.write(out.getbuffer())
+        writer = IncrementalPdfFileWriter(io.BytesIO(content))
+        out = signers.sign_pdf(
+            writer, signers.PdfSignatureMetadata(field_name="BrotoSig"), signer=self._signer)
+        return bytes(out.getbuffer())
 
     def _object_templates(self, klass):
         from pkcs11 import Attribute
@@ -258,12 +381,17 @@ class DscSigner:
         return self._private_key().sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
 
     def sign_flatfile(self, in_path: str, out_path: str) -> None:
+        """File wrapper around :meth:`sign_flatfile_bytes`."""
+        with open(in_path, "rb") as inf:
+            content = inf.read()
+        with open(out_path, "wb") as outf:
+            outf.write(self.sign_flatfile_bytes(content))
+
+    def sign_flatfile_bytes(self, content: bytes) -> bytes:
         """ICEGATE 'Text file' signature: original content + appended
         <START-SIGNATURE>/<START-CERTIFICATE>/<SIGNER-VERSION> tag lines. The signed
         value is SHA-1(SHA-256(content with trailing CR/LF stripped))."""
         import base64
-        with open(in_path, "rb") as inf:
-            content = inf.read()
         core = content.rstrip(b"\r\n")
         signature = self._double_hash_sign(core)
         cert_der = self._certificate_der()
@@ -271,8 +399,7 @@ class DscSigner:
         out += b"<START-SIGNATURE>" + base64.b64encode(signature) + b"</START-SIGNATURE>\n"
         out += b"<START-CERTIFICATE>" + base64.b64encode(cert_der) + b"</START-CERTIFICATE>\n"
         out += b"<SIGNER-VERSION>" + SIGNER_VERSION + b"</SIGNER-VERSION>"
-        with open(out_path, "wb") as outf:
-            outf.write(out)
+        return out
 
     def sign_icegate_json(self, in_path: str, out_path: str) -> None:
         """File wrapper around :meth:`sign_icegate_json_bytes`."""
@@ -334,6 +461,26 @@ def output_path_for(in_path: str, out_dir: str) -> str:
         return os.path.join(out_dir, base[:-4] + ".signed.pdf")
     stem, ext = os.path.splitext(base)           # e.g. 162026.be -> 162026Signed.be
     return os.path.join(out_dir, stem + "Signed" + ext)
+
+
+BATCH_FOLDER_PREFIX = "Broto Signed"
+
+
+def make_batch_folder(dest: str, now: Optional[datetime] = None) -> str:
+    """Create a NEW folder inside ``dest`` for one signing run and return it —
+    "Broto Signed 30-09-2026 14.05", or "… (2)" if that name is taken — so
+    every run's signed files sit together and never overwrite an earlier run."""
+    now = now or datetime.now()
+    base = "%s %s" % (BATCH_FOLDER_PREFIX, now.strftime("%d-%m-%Y %H.%M"))
+    os.makedirs(dest, exist_ok=True)
+    n = 1
+    while True:
+        path = os.path.join(dest, base if n == 1 else "%s (%d)" % (base, n))
+        try:
+            os.mkdir(path)
+            return path
+        except FileExistsError:
+            n += 1
 
 
 def sign_one(signer: DscSigner, in_path: str, out_dir: str) -> str:

@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 _APP_DIR_NAME = "BrotoSigner"
 _PIN_ENTROPY = b"BrotoSigner/token-pin/v1"
+_REMOTE_ENTROPY = b"BrotoSigner/remote-token/v1"
 
 
 def settings_dir() -> str:
@@ -80,11 +81,11 @@ if sys.platform == "win32":
         buf = ctypes.create_string_buffer(data, len(data))
         return _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
 
-    def _protect(data: bytes) -> bytes:
+    def _protect(data: bytes, entropy: bytes = _PIN_ENTROPY, description: str = "Broto Signer PIN") -> bytes:
         inb, _k1 = _in_blob(data)
-        ent, _k2 = _in_blob(_PIN_ENTROPY)
+        ent, _k2 = _in_blob(entropy)
         out = _Blob()
-        if not _crypt32.CryptProtectData(ctypes.byref(inb), "Broto Signer PIN", ctypes.byref(ent),
+        if not _crypt32.CryptProtectData(ctypes.byref(inb), description, ctypes.byref(ent),
                                          None, None, _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
             raise OSError("CryptProtectData failed (%d)" % ctypes.GetLastError())
         try:
@@ -92,9 +93,9 @@ if sys.platform == "win32":
         finally:
             _kernel32.LocalFree(out.pbData)
 
-    def _unprotect(data: bytes) -> bytes:
+    def _unprotect(data: bytes, entropy: bytes = _PIN_ENTROPY) -> bytes:
         inb, _k1 = _in_blob(data)
-        ent, _k2 = _in_blob(_PIN_ENTROPY)
+        ent, _k2 = _in_blob(entropy)
         out = _Blob()
         if not _crypt32.CryptUnprotectData(ctypes.byref(inb), None, ctypes.byref(ent),
                                            None, None, _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out)):
@@ -104,10 +105,10 @@ if sys.platform == "win32":
         finally:
             _kernel32.LocalFree(out.pbData)
 else:
-    def _protect(data: bytes) -> bytes:
+    def _protect(data: bytes, entropy: bytes = _PIN_ENTROPY, description: str = "") -> bytes:
         raise OSError("PIN saving is only available on Windows.")
 
-    def _unprotect(data: bytes) -> bytes:
+    def _unprotect(data: bytes, entropy: bytes = _PIN_ENTROPY) -> bytes:
         raise OSError("PIN saving is only available on Windows.")
 
 
@@ -132,6 +133,47 @@ def has_saved_pin() -> bool:
 
 def forget_pin() -> None:
     update_settings(pin_dpapi=None)
+
+
+# ------------------------------------------------------------ remote-signing device token
+# The bearer token Broto issues when this PC is paired for remote signing
+# (remote.py). On Windows it gets the PIN's protection: DPAPI, current-user
+# scope — only the same Windows login on the same PC can read it back. On other
+# platforms (development only; real tokens live on Windows) it is kept in plain
+# text in settings.json, under a key that says so.
+def remote_token_protected() -> bool:
+    return sys.platform == "win32"
+
+
+def save_remote_token(token: str) -> None:
+    if remote_token_protected():
+        blob = _protect(token.encode("utf-8"), _REMOTE_ENTROPY, "Broto Signer remote token")
+        update_settings(remote_token_dpapi=base64.b64encode(blob).decode("ascii"), remote_token_plain=None)
+    else:
+        update_settings(remote_token_plain=token, remote_token_dpapi=None)
+
+
+def load_remote_token() -> Optional[str]:
+    data = load_settings()
+    raw = data.get("remote_token_dpapi")
+    if raw:
+        if not remote_token_protected():
+            return None
+        try:
+            return _unprotect(base64.b64decode(raw), _REMOTE_ENTROPY).decode("utf-8")
+        except Exception:  # noqa: BLE001 - other user / other PC / corrupt → not paired
+            return None
+    plain = data.get("remote_token_plain")
+    return str(plain) if plain else None
+
+
+def has_remote_token() -> bool:
+    data = load_settings()
+    return bool(data.get("remote_token_dpapi") or data.get("remote_token_plain"))
+
+
+def forget_remote_token() -> None:
+    update_settings(remote_token_dpapi=None, remote_token_plain=None)
 
 
 # ------------------------------------------------------------ start with Windows
