@@ -47,8 +47,9 @@ APP_TITLE = "Broto DSC Signer"
 # 2.2 = remote signing (pair this PC with the firm's Broto account); 2.3 = several
 # certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear;
 # 2.3.1 = certificate details read while the token session is open (were blank, and 2 showed as 1);
-# 2.3.2 = the token card scrolls (Settings ▸ Remote signing was cut off) + the Remote signing pill opens it.
-APP_VERSION = "2.3.2"
+# 2.3.2 = the token card scrolls (Settings ▸ Remote signing was cut off) + the Remote signing pill opens it;
+# 2.3.3 = Sign stays clickable on a PC paired for remote signing (the remote-signature count hid the file count).
+APP_VERSION = "2.3.3"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -956,9 +957,10 @@ class SignerApp:
         if not rs["paired"]:
             self.remote_pill.configure(text="  Remote signing off  ", text_color=MUTED)
         elif rs["online"]:
-            n = int(rs.get("jobs_signed") or 0)
-            self.remote_pill.configure(text="  ☁  Remote signing on%s  " % ("  ·  %d signed" % n if n else ""),
-                                       text_color=OK)
+            signed = int(rs.get("jobs_signed") or 0)
+            self.remote_pill.configure(
+                text="  ☁  Remote signing on%s  " % ("  ·  %d signed" % signed if signed else ""),
+                text_color=OK)
         elif rs["last_error"]:
             self.remote_pill.configure(text="  ☁  Remote signing — can't reach Broto  ", text_color=WARN)
         else:
