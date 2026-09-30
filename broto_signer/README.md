@@ -165,6 +165,12 @@ retried, because tokens lock after a few wrong PINs.
 ---
 
 ## Notes & known gotchas
+- **Read certificate details while the token session is open.** python-pkcs11
+  reads each attribute live through the session; once the `with tok.open()`
+  block closes, every read fails. v2.3.0 read them after the close, so every
+  certificate showed as a blank "Certificate in slot 1", two blank ones looked
+  identical (only one was listed), and the PC reported no thumbprints — which
+  made Broto reject every remote signature. Fixed in v2.3.1 (`_read_certificates`).
 - **Windows-first.** DSC tokens/drivers are effectively Windows-only.
 - **32- vs 64-bit:** if loading the token DLL fails with *"not a valid Win32
   application"*, Python's bitness doesn't match the driver's. `System32` holds

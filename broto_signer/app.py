@@ -45,8 +45,9 @@ APP_TITLE = "Broto DSC Signer"
 # Bump on every release — the planned self-updater compares this with the
 # server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN;
 # 2.2 = remote signing (pair this PC with the firm's Broto account); 2.3 = several
-# certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear.
-APP_VERSION = "2.3.0"
+# certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear;
+# 2.3.1 = certificate details read while the token session is open (were blank, and 2 showed as 1).
+APP_VERSION = "2.3.1"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -997,6 +998,8 @@ class SignerApp:
             return
         self.cert_name.configure(text=c.common_name or c.display, text_color=TEXT)
         issuer = ("Issued by " + c.issuer) if c.issuer else (c.label or "Certificate on token")
+        if c.serial:
+            issuer += "\nSerial number " + c.serial
         if not c.can_sign:
             issuer += "\nThis certificate is for encryption. Pick your signing certificate above."
         self.cert_issuer.configure(text=issuer)

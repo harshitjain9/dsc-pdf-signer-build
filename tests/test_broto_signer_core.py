@@ -101,3 +101,110 @@ def test_batch_folder_creates_a_missing_destination(tmp_path):
     dest = tmp_path / "new" / "place"
     out = core.make_batch_folder(str(dest), datetime(2026, 1, 2, 3, 4))
     assert os.path.isdir(out) and os.path.dirname(out) == str(dest)
+
+
+# ------------------------------------------------------------ reading the token
+class _FakeObj:
+    """A token object whose attributes read live through its session — like
+    python-pkcs11, where every read fails once the session is closed."""
+
+    def __init__(self, session, attrs):
+        self.session, self.attrs = session, attrs
+
+    def __getitem__(self, key):
+        if self.session.closed:
+            raise RuntimeError("CKR_SESSION_HANDLE_INVALID")
+        return self.attrs[key]
+
+
+class _FakeSession:
+    def __init__(self, objects):
+        self.objects, self.closed = objects, False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def get_objects(self, template):
+        return iter([_FakeObj(self, a) for a in self.objects])
+
+
+def _fake_pkcs11(monkeypatch, slots):
+    """Install a stand-in ``pkcs11`` module: ``slots`` = one list of cert DERs per plugged-in token."""
+    import types
+    mod = types.ModuleType("pkcs11")
+    mod.Attribute = types.SimpleNamespace(CLASS="class", LABEL="label", ID="id", VALUE="value")
+    mod.ObjectClass = types.SimpleNamespace(CERTIFICATE="cert")
+
+    class _Token:
+        def __init__(self, ders):
+            self.ders = ders
+
+        def open(self, user_pin=None):
+            return _FakeSession([{"label": "", "id": b"\x01", "value": d} for d in self.ders])
+
+    class _Slot:
+        def __init__(self, ders):
+            self.token = _Token(ders)
+
+        def get_token(self):
+            return self.token
+
+    class _Lib:
+        def __init__(self, path):
+            pass
+
+        def get_slots(self, token_present=True):
+            return [_Slot(d) for d in slots]
+
+    mod.lib = _Lib
+    monkeypatch.setitem(sys.modules, "pkcs11", mod)
+
+
+def _der(cn, issuer, serial):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    cert = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+            .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer)]))
+            .public_key(key.public_key()).serial_number(serial)
+            .not_valid_before(datetime(2025, 1, 1)).not_valid_after(datetime(2027, 11, 8))
+            .sign(key, hashes.SHA256()))
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def test_two_tokens_list_two_certificates_with_their_details(monkeypatch):
+    """The Aman PC case: two DSC tokens (same key ID on both). v2.3.0 read the
+    details after closing the session, so it listed ONE blank 'Certificate in
+    slot 1'."""
+    import pytest
+    pytest.importorskip("asn1crypto")
+    a = _der("MAHESHWARI HITESH NANJIBHAI", "Capricorn Sub CA for Organisation DSC 2022", 0x4E4478D1BD)
+    b = _der("PARMENDER JOGENDER KOCHAR", "Capricorn Sub CA for Individual DSC 2022", 0x3C4A1B0471)
+    _fake_pkcs11(monkeypatch, [[a], [b]])
+    certs = core.list_certificates("SignatureP11.dll", None)
+    assert [c.common_name for c in certs] == ["MAHESHWARI HITESH NANJIBHAI", "PARMENDER JOGENDER KOCHAR"]
+    assert [c.issuer for c in certs] == ["Capricorn Sub CA for Organisation DSC 2022",
+                                         "Capricorn Sub CA for Individual DSC 2022"]
+    assert [c.serial for c in certs] == ["4E4478D1BD", "3C4A1B0471"]
+    assert [c.slot_index for c in certs] == [0, 1]
+    assert all(c.thumbprint and c.cert_id == b"\x01" for c in certs)   # Broto pins remote signing on the thumbprint
+
+
+def test_same_certificate_in_two_slots_is_listed_once(monkeypatch):
+    import pytest
+    pytest.importorskip("asn1crypto")
+    a = _der("RAMESH", "CA", 7)
+    _fake_pkcs11(monkeypatch, [[a], [a]])
+    assert len(core.list_certificates("x.dll", None)) == 1
+
+
+def test_unreadable_certificates_are_never_merged(monkeypatch):
+    _fake_pkcs11(monkeypatch, [[None, None]])       # the token refuses to hand over the certificate bytes
+    certs = core.list_certificates("x.dll", None)
+    assert len(certs) == 2 and not any(c.thumbprint for c in certs)

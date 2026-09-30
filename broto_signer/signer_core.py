@@ -127,8 +127,7 @@ def _describe_cert(der: bytes) -> dict:
     import hashlib
 
     from asn1crypto import x509
-    out = {"subject": "", "common_name": "", "issuer": "", "not_after": None, "serial": "", "thumbprint": "",
-           "can_sign": True}
+    out = _blank_info()
     try:
         out["thumbprint"] = hashlib.sha256(der).hexdigest()
     except Exception:
@@ -168,50 +167,74 @@ def _describe_cert(der: bytes) -> dict:
     return out
 
 
-def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
-    """Enumerate signing certificates across the token's slots. Tries a public
-    (no-login) session first; retries with the PIN if the token hides certs
-    until authenticated."""
-    import pkcs11
+def _blank_info() -> dict:
+    return {"subject": "", "common_name": "", "issuer": "", "not_after": None, "serial": "", "thumbprint": "",
+            "can_sign": True}
+
+
+def _read_certificates(session, slot_index: int, module: str) -> List[CertInfo]:
+    """Every certificate on an OPEN session, with its details.
+
+    The details MUST be read before the session closes: python-pkcs11 reads
+    each attribute live through the session handle, so after the ``with``
+    block has closed it every read fails. (Until v2.3.1 the reads ran after
+    the close — every certificate came back blank as "Certificate in slot 1",
+    and two blank certificates looked identical, so only one was listed.)"""
     from pkcs11 import Attribute, ObjectClass
+    out: List[CertInfo] = []
+    for cert in list(session.get_objects({Attribute.CLASS: ObjectClass.CERTIFICATE})):
+        label = ""
+        try:
+            label = cert[Attribute.LABEL] or ""
+        except Exception:
+            pass
+        cert_id = b""
+        try:
+            cert_id = bytes(cert[Attribute.ID])
+        except Exception:
+            pass
+        info = _blank_info()
+        try:
+            info = _describe_cert(bytes(cert[Attribute.VALUE]))
+        except Exception:
+            pass
+        out.append(CertInfo(label=label, cert_id=cert_id, slot_index=slot_index, module=module, **info))
+    return out
+
+
+def list_certificates(module: str, pin: Optional[str] = None) -> List[CertInfo]:
+    """Enumerate the certificates on every token this driver can see (each
+    plugged-in token is a slot). Reads without logging in first — certificates
+    are public on DSC tokens — and uses the PIN only for a token that shows
+    none, or none it could read, that way."""
+    import pkcs11
 
     lib = pkcs11.lib(module)
     out: List[CertInfo] = []
     seen = set()
     for slot_index, slot in enumerate(lib.get_slots(token_present=True)):
         tok = slot.get_token()
-        certs = []
+        found: List[CertInfo] = []
         for use_pin in (None, pin):
+            if use_pin is not None and any(c.thumbprint for c in found):
+                break                                   # already read without the PIN
             try:
                 with tok.open(user_pin=use_pin) as session:
-                    certs = list(session.get_objects({Attribute.CLASS: ObjectClass.CERTIFICATE}))
-                if certs:
-                    break
+                    got = _read_certificates(session, slot_index, module)
+                if got and (not found or any(c.thumbprint for c in got)):
+                    found = got
             except Exception:
                 pass
             if pin is None:
                 break
-        for cert in certs:
-            try:
-                label = cert[Attribute.LABEL]
-            except Exception:
-                label = ""
-            cert_id = b""
-            try:
-                cert_id = bytes(cert[Attribute.ID])
-            except Exception:
-                pass
-            info = {"subject": "", "common_name": "", "issuer": "", "not_after": None, "serial": "", "thumbprint": "",
-                    "can_sign": True}
-            try:
-                info = _describe_cert(bytes(cert[Attribute.VALUE]))
-            except Exception:
-                pass
-            key = (label, info["subject"], cert_id)
+        for n, c in enumerate(found):
+            # The same certificate in two slots is listed once; certificates
+            # whose details could not be read are never merged with each other.
+            key = c.thumbprint or (slot_index, n)
             if key in seen:
                 continue
             seen.add(key)
-            out.append(CertInfo(label=label or "", cert_id=cert_id, slot_index=slot_index, module=module, **info))
+            out.append(c)
     return out
 
 
