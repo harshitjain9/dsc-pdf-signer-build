@@ -46,8 +46,9 @@ APP_TITLE = "Broto DSC Signer"
 # server's "latest" record. 1.x = original Tk UI; 2.0 = redesign; 2.1 = one-click bridge + saved PIN;
 # 2.2 = remote signing (pair this PC with the firm's Broto account); 2.3 = several
 # certificates / tokens to pick from, SignatureP11 default, a new folder per run, auto-clear;
-# 2.3.1 = certificate details read while the token session is open (were blank, and 2 showed as 1).
-APP_VERSION = "2.3.1"
+# 2.3.1 = certificate details read while the token session is open (were blank, and 2 showed as 1);
+# 2.3.2 = the token card scrolls (Settings ▸ Remote signing was cut off) + the Remote signing pill opens it.
+APP_VERSION = "2.3.2"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -501,8 +502,10 @@ class SignerApp:
                      text_color=MUTED, font=_font(12), anchor="w").grid(row=1, column=1, sticky="nw")
         pills = ctk.CTkFrame(head, fg_color="transparent")
         pills.grid(row=0, column=2, rowspan=2, sticky="e")
-        self.remote_pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
-                                        font=_font(12, "bold"))
+        # A button, not a label: clicking it opens Settings at the pairing-code box.
+        self.remote_pill = ctk.CTkButton(pills, text="", width=0, height=30, corner_radius=15, fg_color=CARD,
+                                         hover_color=ROW_HOVER, font=_font(12, "bold"),
+                                         command=self._show_remote_settings)
         self.remote_pill.pack(side="left", padx=(0, 8))
         self.bridge_pill = ctk.CTkLabel(pills, text="", height=30, corner_radius=15, fg_color=CARD,
                                         font=_font(12, "bold"))
@@ -527,9 +530,17 @@ class SignerApp:
         self._build_footer(r)
 
     def _build_token_card(self, parent) -> None:
-        card = Card(parent)
-        card.grid(row=0, column=0, sticky="nsew", padx=(0, 16), pady=(0, 16))
+        outer = Card(parent)
+        outer.grid(row=0, column=0, sticky="nsew", padx=(0, 16), pady=(0, 16))
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+        # Scrolls, so an open Settings section (driver, start-up, Remote signing)
+        # is never cut off at the bottom of a small window.
+        card = ctk.CTkScrollableFrame(outer, width=330, fg_color="transparent", corner_radius=0,
+                                      scrollbar_button_color=BORDER, scrollbar_button_hover_color=MUTED)
+        card.grid(row=0, column=0, sticky="nsew", padx=(2, 2), pady=(2, 2))
         card.grid_columnconfigure(0, weight=1)
+        self.token_scroll = card
         step_title(card, "1", "Your DSC token").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 4))
         ctk.CTkLabel(card, text="Plug in the token and enter its PIN.", text_color=MUTED,
                      font=_font(12), anchor="w").grid(row=1, column=0, sticky="w", padx=18)
@@ -607,6 +618,7 @@ class SignerApp:
         box = ctk.CTkFrame(parent, fg_color="transparent")
         box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         box.grid_columnconfigure(0, weight=1)
+        self.remote_box = box
         ctk.CTkLabel(box, text="Remote signing", text_color=TEXT, font=_font(12, "bold"),
                      anchor="w").grid(row=0, column=0, columnspan=2, sticky="w")
         hint = ("Let your team sign from anywhere while this PC stays on with the token plugged in. "
@@ -1016,6 +1028,22 @@ class SignerApp:
         else:
             self.cert_expiry.configure(text="")
         self._refresh()
+
+    def _show_remote_settings(self) -> None:
+        """Header "Remote signing" pill: open Settings, scroll the Remote signing
+        box into view and put the cursor in the pairing-code box."""
+        self._toggle_driver(True)
+        self.root.update_idletasks()
+        canvas = getattr(self.token_scroll, "_parent_canvas", None)
+        if canvas is not None:
+            try:
+                total = max(1, self.token_scroll.winfo_height())
+                y = self.remote_box.winfo_rooty() - self.token_scroll.winfo_rooty()
+                canvas.yview_moveto(max(0.0, min(1.0, (y - 12) / float(total))))
+            except Exception:  # noqa: BLE001 - scrolling is a nicety
+                pass
+        if not self.remote.paired:
+            self.pair_entry.focus_set()
 
     def _toggle_driver(self, open_: bool) -> None:
         self._driver_open = open_
