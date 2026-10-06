@@ -149,7 +149,8 @@ Broto's **Settings ▸ DSC computers** list reads.
 **Signing for someone else.** When a colleague clicks **Sign & file on ICEGATE**
 on a PC that has no Broto Signer, Broto emails a one-time code to the firm's
 ICEGATE OTP mailbox; once they type it, this PC picks the job up on its next
-check-in (every 5 seconds while someone is filing, 30 seconds otherwise). It
+check-in (every 2 seconds while a code is being typed, 5 seconds while someone
+is filing, 30 seconds otherwise). It
 checks the payload exactly as the popup does (an unsigned BE/SB filing, nothing
 else), signs and hands the file back — Broto verifies the signature and that it
 came from the right certificate, then files. **Which certificate:** every
@@ -170,6 +171,22 @@ fingerprint Broto announced, is checked to be a PDF under 25 MB that matches
 it, gets a PAdES signature (an incremental update — the original bytes stay
 intact), and Broto stores the signed copy on the job. No PDF/A conversion
 happens here.
+
+**A run of several files (v2.5.0, e.g. Sign & eSANCHIT).** While the code is
+being typed, Broto asks this PC to check in every 2 seconds. Then the PC takes
+the whole run in one call (`POST /jobs/claim`) and three things overlap: the
+next two files download (`POST /jobs/{id}/content`), the token signs the
+current one, and up to two signed files go back (`POST /jobs/{id}/result`).
+The token still signs **one file at a time** — a token chip does one signature
+at a time, and some drivers fail when asked for two — and it is logged in
+**once for the run** (`RemoteSignSession` in `app.py`): before 2.5.0 every
+file read all the certificates again and typed the PIN again. A token that
+refuses its saved PIN is never tried again in that run; every file needing it
+fails at once with the same reason. The Activity log shows each step's time
+("got it in 0.8 s · signed in 1.1 s · sent back in 1.9 s") and one line per run;
+the same timings go to Broto's logs. A Broto from before runs answers the claim
+with 404, and the PC then takes files one at a time as before (still one
+login per check-in).
 
 And the **.be / .sb flat files** (the flat-file step ▸ "Sign .be on <this
 PC>"): Broto generates the file through the download's own checks and hands it

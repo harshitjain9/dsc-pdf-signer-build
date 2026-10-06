@@ -228,13 +228,18 @@ TWO = CertInfo(label="", subject="CN=HOLDER TWO", cert_id=b"\x01", common_name="
 
 class _FakeSigner:
     opened = []
+    attempts = []           # every login tried, refused ones included
+    fail_next_sign = []     # exceptions the next signatures raise, in turn
 
     def __init__(self, module, pin, cert_id=b"", cert_label="", slot_index=0):
+        _FakeSigner.attempts.append((module, pin, slot_index))
         if pin == "bad":
             raise RuntimeError("CKR_PIN_INCORRECT")
         _FakeSigner.opened.append((module, pin, slot_index))
 
     def sign_flatfile_bytes(self, content):
+        if _FakeSigner.fail_next_sign:
+            raise _FakeSigner.fail_next_sign.pop(0)
         return content + b"<signed>"
 
     def close(self):
@@ -249,7 +254,7 @@ def _remote_app(monkeypatch, pins, picked=ONE):
     monkeypatch.setattr(signer_app, "list_certificates", lambda module, pin=None, pins=None: [ONE, TWO])
     monkeypatch.setattr(signer_app, "DscSigner", _FakeSigner)
     monkeypatch.setattr(signer_app.os.path, "exists", lambda p: p == "p11.dll")
-    _FakeSigner.opened = []
+    _FakeSigner.opened, _FakeSigner.attempts, _FakeSigner.fail_next_sign = [], [], []
     app = object.__new__(signer_app.SignerApp)
     app.q = queue.Queue()
     app._token_lock = threading.Lock()
@@ -321,3 +326,70 @@ def test_broto_hears_which_certificates_have_their_tokens_pin_saved(monkeypatch)
     assert screen._saved_pin == "1111"
     screen.cert_choice = _Value("HOLDER TWO")
     assert screen._saved_pin is None                                # B's token has no PIN saved
+
+
+# ------------------------------------------------------------ a run of remote jobs: one token login
+def test_a_run_logs_in_to_the_token_once_and_holds_it_until_the_end(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"}, picked=ONE)
+    session = app._remote_session()
+    out = [session.sign(b"HREC%d" % i, _flatfile_summary(TP_TWO, "HOLDER TWO")) for i in range(3)]
+    assert out == [b"HREC0<signed>", b"HREC1<signed>", b"HREC2<signed>"]
+    assert _FakeSigner.opened == [("p11.dll", "2222", 1)]                    # one login for three files
+    assert app._token_lock.locked()                                           # local signing waits for the run
+    session.close()
+    assert not app._token_lock.locked()
+
+
+def test_a_run_with_two_certificates_opens_each_token_once(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"})
+    session = app._remote_session()
+    for thumbprint in (TP_ONE, TP_TWO, TP_ONE, TP_TWO):
+        assert session.sign(b"HREC", _flatfile_summary(thumbprint)) == b"HREC<signed>"
+    session.close()
+    assert _FakeSigner.opened == [("p11.dll", "1111", 0), ("p11.dll", "2222", 1)]
+
+
+def test_a_refused_pin_is_tried_once_per_run_never_again(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "bad"})
+    session = app._remote_session()
+    codes = []
+    for _ in range(3):
+        with pytest.raises(signer_app.SignError) as ei:
+            session.sign(b"HREC", _flatfile_summary(TP_TWO, "HOLDER TWO"))
+        codes.append(ei.value.code)
+    assert codes == ["wrong_pin"] * 3
+    assert _FakeSigner.attempts == [("p11.dll", "bad", 1)]                   # one wrong try, not three
+    assert app.q.get_nowait() == ("remote", "pin_rejected", "sn:B") and app.q.empty()
+    assert session.sign(b"HREC", _flatfile_summary(TP_ONE)) == b"HREC<signed>"   # the other token still signs
+    session.close()
+    assert not app._token_lock.locked()
+
+
+def test_a_failure_inside_the_token_session_opens_a_fresh_one_for_the_next_file(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"})
+    _FakeSigner.fail_next_sign = [RuntimeError("CKR_DEVICE_ERROR")]
+    session = app._remote_session()
+    with pytest.raises(signer_app.SignError) as ei:
+        session.sign(b"HREC", _flatfile_summary(TP_ONE))
+    assert ei.value.code == "failed" and "CKR_DEVICE_ERROR" in ei.value.message
+    assert session.sign(b"HREC", _flatfile_summary(TP_ONE)) == b"HREC<signed>"
+    session.close()
+    assert _FakeSigner.opened == [("p11.dll", "1111", 0), ("p11.dll", "1111", 0)]
+
+
+def test_the_certificates_are_read_once_per_run(monkeypatch):
+    app = _remote_app(monkeypatch, {"sn:A": "1111", "sn:B": "2222"})
+    reads = []
+    monkeypatch.setattr(signer_app, "list_certificates",
+                        lambda module, pin=None, pins=None: reads.append(module) or [ONE, TWO])
+    session = app._remote_session()
+    for _ in range(3):
+        session.sign(b"HREC", _flatfile_summary(TP_ONE))
+    session.close()
+    assert reads == ["p11.dll"]
+
+
+def test_the_activity_log_says_how_long_each_step_took():
+    assert (signer_app._timing_note({"fetch_ms": 812, "sign_ms": 1100, "send_ms": 1949})
+            == " (got it in 0.8 s · signed in 1.1 s · sent back in 1.9 s)")
+    assert signer_app._timing_note({}) == "" and signer_app._timing_note(None) == ""

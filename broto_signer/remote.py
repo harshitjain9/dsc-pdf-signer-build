@@ -20,6 +20,13 @@ How pairing works (server side: cha_api/signer_devices.py):
      token and tell the user. Network trouble is reported as "offline" and
      retried forever — the PC may simply have lost its connection.
 
+Signing a run (Broto's "Sign & eSANCHIT", several files at once): the
+heartbeat says jobs are waiting, we take the whole run in one call, and then
+three things overlap — the next files download from Broto, the token signs
+the current one, and signed files go back to Broto. The token itself signs
+one file at a time and is logged in once for the run (a token chip does one
+signature at a time, and every extra login is another chance to lock it).
+
 Standard library only (urllib honours the system proxy). No UI here: the app
 supplies ``report_fn`` (a snapshot of its state, safe to read off-thread) and
 ``notify(event, payload)`` (called from worker threads — route it through the
@@ -36,7 +43,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Optional
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import bridge
 import secure_store as store
@@ -44,15 +53,20 @@ import secure_store as store
 DEFAULT_API_BASE = "https://api.brotoai.com"
 API_PATH = "/api/cha/signer-devices"
 HEARTBEAT_INTERVAL_S = 30
+MIN_HEARTBEAT_S = 2             # the fastest pace Broto may ask for (while someone types the one-time code)
 OFFLINE_AFTER_FAILURES = 2      # consecutive failed heartbeats before we call it "offline"
 TIMEOUT_S = 15
 MAX_CERTIFICATES = 10
 MAX_JOBS_PER_DRAIN = 10         # signing jobs taken in one go before the next heartbeat
+FETCH_LANES = 2                 # files downloading from Broto at the same time while the token signs
+POST_LANES = 2                  # signed files going back to Broto at the same time (each holds a Broto DB slot)
+READ_AHEAD = 2                  # downloaded files waiting for the token, at most
 
 # Events handed to ``notify`` (payload in brackets):
 #   paired (status dict) · pair_failed (message) · online (status dict) ·
 #   offline (message) · revoked (message) · disconnected (None) ·
-#   job_signed ({job, summary}) · job_failed ({job, summary, code, message})
+#   job_signed ({job, summary, timings}) · job_failed ({job, summary, code, message}) ·
+#   run_done ({signed, failed, seconds}) — after a run of several jobs
 
 
 class RemoteError(Exception):
@@ -253,13 +267,41 @@ class RemoteClient:
         """Claim the oldest queued signing job → ``{"job": {...} | None}``."""
         return self._call("/jobs/next", {}, bearer=self.token)
 
+    def claim_jobs(self, max_jobs: int = MAX_JOBS_PER_DRAIN) -> Dict[str, Any]:
+        """Take up to ``max_jobs`` queued jobs at once → ``{"jobs": [{"id", "kind"}, …]}``.
+        A Broto from before runs answers 404 (then we take them one at a time)."""
+        return self._call("/jobs/claim", {"max": int(max_jobs)}, bearer=self.token)
+
+    def job_content(self, job_id: str) -> Dict[str, Any]:
+        """The exact bytes of one claimed job → ``{"job": {...} | None}`` (``None``:
+        the file was deleted or changed, and Broto has failed that job itself)."""
+        return self._call("/jobs/%s/content" % job_id, {}, bearer=self.token)
+
     def post_result(self, job_id: str, *, signed: Optional[bytes] = None, code: Optional[str] = None,
-                    message: Optional[str] = None) -> Dict[str, Any]:
+                    message: Optional[str] = None, timings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if signed is not None:
             body: Dict[str, Any] = {"ok": True, "signed_b64": base64.b64encode(signed).decode("ascii")}
         else:
             body = {"ok": False, "code": code or "failed", "message": (message or "")[:1000]}
+        if timings:
+            body["timings"] = {k: int(v) for k, v in timings.items() if isinstance(v, (int, float))}
         return self._call("/jobs/%s/result" % job_id, body, bearer=self.token)
+
+
+class _OneCallSession:
+    """A signing session made from a plain ``sign_fn`` (one token login per
+    call) — what RemoteLink uses when the app gives no ``session_fn``."""
+
+    def __init__(self, sign_fn: Optional[Callable[[bytes, Dict[str, Any]], bytes]]) -> None:
+        self.sign_fn = sign_fn
+
+    def sign(self, content: bytes, summary: Dict[str, Any]) -> bytes:
+        if self.sign_fn is None:
+            raise SignError("no_signer", "Remote signing isn't available in this build of the Broto Signer.")
+        return self.sign_fn(content, summary)
+
+    def close(self) -> None:
+        pass
 
 
 # ------------------------------------------------------------------ the link
@@ -269,6 +311,7 @@ class RemoteLink:
     def __init__(self, report_fn: Callable[[], Dict[str, Any]],
                  notify: Callable[[str, Any], None], *,
                  sign_fn: Optional[Callable[[bytes, Dict[str, Any]], bytes]] = None,
+                 session_fn: Optional[Callable[[], Any]] = None,
                  client_cls: Callable[..., Any] = RemoteClient,
                  interval_s: float = HEARTBEAT_INTERVAL_S) -> None:
         self.report_fn = report_fn
@@ -276,7 +319,13 @@ class RemoteLink:
         # sign_fn(content, summary) -> signed bytes, or raise SignError. Runs on
         # the heartbeat thread; the app must not touch Tk inside it.
         self.sign_fn = sign_fn
+        # session_fn() -> an object with sign(content, summary) and close(): ONE
+        # token login for every job of a run. Without it, sign_fn per job.
+        self.session_fn = session_fn
+        self.fetch_lanes = FETCH_LANES
+        self.post_lanes = POST_LANES
         self.jobs_signed = 0
+        self._count_lock = threading.Lock()
         self._client_cls = client_cls
         self.interval_s = float(interval_s)
         self.api_base = default_api_base()
@@ -371,48 +420,170 @@ class RemoteLink:
             self._drain(client)
 
     # ----------------------------------------------------------- signing jobs
+    def _open_session(self) -> Any:
+        if self.session_fn is not None:
+            return self.session_fn()
+        return _OneCallSession(self.sign_fn)
+
     def _drain(self, client: Any) -> None:
+        """Take the queued signing jobs: the whole run in one call and signed as
+        a pipeline (``_run_batch``), or — from a Broto that predates runs — one
+        at a time (``_drain_one_by_one``)."""
+        try:
+            out = client.claim_jobs(MAX_JOBS_PER_DRAIN)
+        except RemoteError as e:
+            if e.status in (404, 405):
+                self._drain_one_by_one(client)
+            else:
+                self.last_error = e.message
+            return
+        jobs = out.get("jobs") if isinstance(out, dict) else None
+        metas = [j for j in (jobs or []) if isinstance(j, dict) and j.get("id")]
+        if metas:
+            self._run_batch(client, metas)
+
+    def _drain_one_by_one(self, client: Any) -> None:
         """Take queued signing jobs one at a time until Broto has none left (or
         MAX_JOBS_PER_DRAIN). Each job: same payload guard rail as the local
-        popup → sign_fn with the saved PIN → hand the result back."""
-        for _ in range(MAX_JOBS_PER_DRAIN):
-            try:
-                out = client.next_job()
-            except RemoteError as e:
-                self.last_error = e.message
-                return
-            job = out.get("job") if isinstance(out, dict) else None
-            if not isinstance(job, dict) or not job.get("id"):
-                return
-            self._handle_job(client, job)
+        popup → sign with the saved PIN → hand the result back. One token login
+        serves the whole drain."""
+        session = self._open_session()
+        try:
+            for _ in range(MAX_JOBS_PER_DRAIN):
+                try:
+                    out = client.next_job()
+                except RemoteError as e:
+                    self.last_error = e.message
+                    return
+                job = out.get("job") if isinstance(out, dict) else None
+                if not isinstance(job, dict) or not job.get("id"):
+                    return
+                summary, signed, failure, _sign_s = self._sign_job(job, session)
+                self._finish_job(client, job, summary, signed, failure, None)
+        finally:
+            session.close()
 
-    def _handle_job(self, client: Any, job: Dict[str, Any]) -> None:
-        job_id = str(job.get("id") or "")
+    def _run_batch(self, client: Any, metas: List[Dict[str, Any]]) -> None:
+        """Sign a claimed run as a pipeline: up to ``fetch_lanes`` files download
+        from Broto while the token signs, and each signed file goes back on one
+        of ``post_lanes`` while the token moves on to the next. The token signs
+        one file at a time, in claim order, logged in once for the whole run."""
+        started = time.monotonic()
+        fetch_pool = ThreadPoolExecutor(max_workers=max(1, self.fetch_lanes), thread_name_prefix="broto-fetch")
+        post_pool = ThreadPoolExecutor(max_workers=max(1, self.post_lanes), thread_name_prefix="broto-send")
+        todo = deque(metas)
+        ahead: "deque[Tuple[Dict[str, Any], Any]]" = deque()   # downloads started, in claim order
+        sent: List[Any] = []
+        session = self._open_session()
+
+        def top_up() -> None:
+            while todo and len(ahead) < max(1, self.fetch_lanes, READ_AHEAD):
+                meta = todo.popleft()
+                ahead.append((meta, fetch_pool.submit(self._fetch_job, client, meta)))
+
+        try:
+            top_up()
+            while ahead:
+                meta, pending = ahead.popleft()
+                top_up()                                   # the next downloads run while this one signs
+                job, fetch_s, error = pending.result()
+                if job is None:
+                    if error is not None:                  # couldn't get the file from Broto
+                        sent.append(post_pool.submit(self._report_failure, client, meta, None, error.code,
+                                                     error.message))
+                    continue                               # else Broto failed that job itself (file gone / changed)
+                summary, signed, failure, sign_s = self._sign_job(job, session)
+                timings = {"fetch_ms": int(fetch_s * 1000), "sign_ms": int(sign_s * 1000)}
+                sent.append(post_pool.submit(self._finish_job, client, job, summary, signed, failure, timings))
+        finally:
+            session.close()                                # the token is free before the last files finish sending
+            fetch_pool.shutdown(wait=True)
+            post_pool.shutdown(wait=True)
+        outcomes = [f.result() for f in sent if f.done() and not f.cancelled() and f.exception() is None]
+        ok = sum(1 for o in outcomes if o is True)
+        if len(metas) > 1:
+            self.notify("run_done", {"signed": ok, "failed": len(metas) - ok,
+                                     "seconds": round(time.monotonic() - started, 1)})
+
+    def _fetch_job(self, client: Any, meta: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], float,
+                                                                      Optional[RemoteError]]:
+        """Download one claimed job (a fetch lane): ``(job, seconds, None)``;
+        ``(None, seconds, None)`` when Broto failed the job itself (the file was
+        deleted or changed); ``(None, seconds, error)`` when we couldn't get it."""
+        started = time.monotonic()
+        error: Optional[RemoteError] = None
+        for _attempt in range(2):                          # one retry, for a network blip only
+            try:
+                out = client.job_content(str(meta.get("id") or ""))
+            except RemoteError as e:
+                error = e
+                if e.code != "network":
+                    break
+                continue
+            except Exception as e:  # noqa: BLE001 - one bad answer must not stop the rest of the run
+                error = RemoteError("failed", str(e) or repr(e))
+                break
+            job = out.get("job") if isinstance(out, dict) else None
+            return (job if isinstance(job, dict) and job.get("id") else None), time.monotonic() - started, None
+        return None, time.monotonic() - started, error
+
+    def _sign_job(self, job: Dict[str, Any], session: Any) -> Tuple[Optional[Dict[str, Any]], Optional[bytes],
+                                                                    Optional[Tuple[str, str]], float]:
+        """Check one job's bytes and sign them on the token. Returns ``(summary,
+        signed, failure, seconds)``: ``failure`` = ``(code, message)`` Broto
+        shows the person who asked; ``seconds`` = the time spent signing."""
         summary: Optional[Dict[str, Any]] = None
+        started = time.monotonic()
         try:
             content = base64.b64decode(str(job.get("content_b64") or ""), validate=True)
             summary = describe_job(job, content)             # the guard rail: filing JSON or a job's PDF, nothing else
             # The certificate of the job's ICEGATE ID (Broto sends it once an admin has
-            # tied certificates to IDs) — sign_fn signs with exactly that one.
+            # tied certificates to IDs) — the session signs with exactly that one.
             summary["cert_thumbprint"] = str(job.get("cert_thumbprint") or "").lower()
             summary["cert_holder"] = str(job.get("cert_holder") or "")
-            if self.sign_fn is None:
-                raise SignError("no_signer", "Remote signing isn't available in this build of the Broto Signer.")
-            signed = self.sign_fn(content, summary)
+            started = time.monotonic()
+            signed = session.sign(content, summary)
             if not isinstance(signed, (bytes, bytearray)) or not signed:
                 raise SignError("failed", "The signer returned nothing.")
-            client.post_result(job_id, signed=bytes(signed))
-            self.jobs_signed += 1
-            self.notify("job_signed", {"job": job, "summary": summary})
+            return summary, bytes(signed), None, time.monotonic() - started
         except bridge.PayloadRejected as e:
-            self._report_failure(client, job, summary, "rejected_payload", str(e))
+            return summary, None, ("rejected_payload", str(e)), 0.0
         except SignError as e:
-            self._report_failure(client, job, summary, e.code, e.message)
-        except RemoteError as e:                               # handing the result back failed
+            return summary, None, (e.code, e.message), time.monotonic() - started
+        except Exception as e:  # noqa: BLE001
+            return summary, None, ("failed", str(e) or repr(e)), time.monotonic() - started
+
+    def _finish_job(self, client: Any, job: Dict[str, Any], summary: Optional[Dict[str, Any]],
+                    signed: Optional[bytes], failure: Optional[Tuple[str, str]],
+                    timings: Optional[Dict[str, int]]) -> bool:
+        """Hand one job's outcome back to Broto and tell the app (a send lane in
+        a run). True when Broto took the signed file."""
+        if failure is not None or signed is None:
+            code, message = failure or ("failed", "The signer returned nothing.")
+            self._report_failure(client, job, summary, code, message)
+            return False
+        sent_at = time.monotonic()
+        extra = {"timings": timings} if timings else {}
+        try:
+            out = client.post_result(str(job.get("id") or ""), signed=signed, **extra)
+        except RemoteError as e:                           # handing the result back failed
             self.last_error = e.message
             self.notify("job_failed", {"job": job, "summary": summary, "code": e.code, "message": e.message})
+            return False
         except Exception as e:  # noqa: BLE001
             self._report_failure(client, job, summary, "failed", str(e) or repr(e))
+            return False
+        status = out.get("status") if isinstance(out, dict) else None
+        if status and status != "signed":                  # Broto checked the file and refused it
+            self.notify("job_failed", {"job": job, "summary": summary,
+                                       "code": out.get("error_code") or "failed",
+                                       "message": out.get("error_message") or "Broto did not keep the signed file."})
+            return False
+        with self._count_lock:
+            self.jobs_signed += 1
+        done = dict(timings or {}, send_ms=int((time.monotonic() - sent_at) * 1000)) if timings else {}
+        self.notify("job_signed", {"job": job, "summary": summary, "timings": done})
+        return True
 
     def _report_failure(self, client: Any, job: Dict[str, Any], summary: Optional[Dict[str, Any]],
                         code: str, message: str) -> None:
@@ -430,7 +601,7 @@ class RemoteLink:
 
     def _absorb(self, out: Dict[str, Any]) -> None:
         iv = out.get("heartbeat_interval_s")
-        if isinstance(iv, (int, float)) and 5 <= iv <= 600:
+        if isinstance(iv, (int, float)) and MIN_HEARTBEAT_S <= iv <= 600:
             self.interval_s = float(iv)
         if out.get("firm_name"):
             self.firm_name = str(out["firm_name"])

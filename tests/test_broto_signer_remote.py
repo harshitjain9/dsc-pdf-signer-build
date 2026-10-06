@@ -125,17 +125,21 @@ def test_client_reports_network_trouble_as_network():
 # ------------------------------------------------------------ link (fake client)
 def _fake_client_cls(script):
     """A RemoteClient stand-in. ``script`` maps method -> list of results; a
-    result that is an Exception is raised. Records every call."""
+    result that is an Exception is raised. Records every call. Without a
+    ``claim_jobs`` script it answers like a Broto from before runs (404), so
+    the Signer takes jobs one at a time with ``next_job``."""
     calls = []
+    lock = threading.Lock()                     # a run calls from several threads
 
     class Fake:
         def __init__(self, base_url, token=None, **_kw):
             self.base_url, self.token = base_url, token
 
         def _next(self, method, body):
-            calls.append((method, self.base_url, self.token, body))
-            outcomes = script.get(method) or []
-            out = outcomes.pop(0) if outcomes else {"ok": True}
+            with lock:
+                calls.append((method, self.base_url, self.token, body))
+                outcomes = script.get(method) or []
+                out = outcomes.pop(0) if outcomes else {"ok": True}
             if isinstance(out, Exception):
                 raise out
             return out
@@ -152,8 +156,28 @@ def _fake_client_cls(script):
         def next_job(self):
             return self._next("next_job", {})
 
-        def post_result(self, job_id, signed=None, code=None, message=None):
+        def claim_jobs(self, max_jobs=10):
+            if "claim_jobs" not in script:
+                raise remote.RemoteError("http_404", "Not Found", 404)
+            return self._next("claim_jobs", {"max": max_jobs})
+
+        def job_content(self, job_id):
+            with lock:
+                contents = script.get("job_content") or {}
+                out = contents.get(job_id, {"job": None})
+                if isinstance(out, list):                     # a list = one answer per call
+                    out = out.pop(0)
+                calls.append(("job_content", self.base_url, self.token, {"job_id": job_id}))
+            hook = script.get("on_content")
+            if hook:
+                hook(job_id)
+            if isinstance(out, Exception):
+                raise out
+            return out
+
+        def post_result(self, job_id, signed=None, code=None, message=None, **extra):
             body = {"job_id": job_id, "ok": signed is not None, "signed": signed, "code": code, "message": message}
+            body.update(extra)
             return self._next("post_result", body)
 
     Fake.calls = calls
@@ -487,6 +511,209 @@ def test_drain_survives_broto_dropping_mid_way():
     link._beat()                                                  # must not raise
     assert events[-1][0] == "job_failed" and events[-1][1]["code"] == "network"
     assert link.paired and link.last_error == "Couldn't reach Broto (timeout)."
+
+
+# ------------------------------------------------------------ runs (Broto 2026-10 takes the whole run at once)
+def _pdf_job(job_id, name="inv.pdf", body=b"invoice"):
+    import hashlib
+    pdf = b"%PDF-1.7\n" + body + b"\n%%EOF\n"
+    return pdf, {"kind": "document", "id": job_id, "filename": name, "doc_type": "invoice", "job_seq": "386",
+                 "sha256": hashlib.sha256(pdf).hexdigest(), "content_b64": base64.b64encode(pdf).decode(),
+                 "requested_by": "ops@firm.com"}
+
+
+class _Session:
+    """A token session stand-in: records what it signed and how many signatures
+    ever ran at the same moment."""
+
+    def __init__(self, fail=None, delay=0.0):
+        self.signed, self.closed, self.fail, self.delay = [], 0, dict(fail or {}), delay
+        self.active = self.most_at_once = 0
+        self._lock = threading.Lock()
+
+    def sign(self, content, summary):
+        with self._lock:
+            self.active += 1
+            self.most_at_once = max(self.most_at_once, self.active)
+        try:
+            if self.delay:
+                import time
+                time.sleep(self.delay)
+            if summary["filename"] in self.fail:
+                raise self.fail[summary["filename"]]
+            self.signed.append(summary["filename"])
+            return content + b"\n<signature>"
+        finally:
+            with self._lock:
+                self.active -= 1
+
+    def close(self):
+        self.closed += 1
+
+
+def _run_link(script, events, session):
+    cls = _fake_client_cls(script)
+    secure_store.save_remote_token("tok-1")
+    opened = []
+    link = remote.RemoteLink(report_fn=lambda: remote.device_report(SNAPSHOT, "2.5.0"),
+                             notify=lambda ev, p: events.append((ev, p)),
+                             session_fn=lambda: opened.append(session) or session, client_cls=cls)
+    return link, cls, opened
+
+
+def _claim_of(files):
+    return [{"jobs": [{"id": job["id"], "kind": "document"} for _pdf, job in files]}]
+
+
+def test_a_run_is_taken_at_once_and_signed_in_one_token_session():
+    events, session = [], _Session()
+    files = [_pdf_job("d%d" % i, "f%d.pdf" % i, b"file %d" % i) for i in range(3)]
+    link, cls, opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 3}],
+        "claim_jobs": _claim_of(files),
+        "job_content": {job["id"]: {"job": job} for _pdf, job in files},
+    }, events, session)
+    link._beat()
+    assert opened == [session] and session.closed == 1                       # one token login for the run
+    assert session.signed == ["f0.pdf", "f1.pdf", "f2.pdf"]                 # one at a time, in claim order
+    methods = [c[0] for c in cls.calls]
+    assert methods.count("claim_jobs") == 1 and "next_job" not in methods and methods.count("job_content") == 3
+    assert [c[3] for c in cls.calls if c[0] == "claim_jobs"] == [{"max": remote.MAX_JOBS_PER_DRAIN}]
+    results = sorted((c[3] for c in cls.calls if c[0] == "post_result"), key=lambda b: b["job_id"])
+    assert [r["job_id"] for r in results] == ["d0", "d1", "d2"]
+    assert all(r["ok"] and r["signed"].endswith(b"<signature>") for r in results)
+    assert all(set(r["timings"]) == {"fetch_ms", "sign_ms"} for r in results)
+    kinds = [e for e, _ in events]
+    assert kinds.count("job_signed") == 3 and kinds[-1] == "run_done"
+    assert events[-1][1]["signed"] == 3 and events[-1][1]["failed"] == 0
+    assert all({"fetch_ms", "sign_ms", "send_ms"} <= set(p["timings"]) for e, p in events if e == "job_signed")
+    assert link.jobs_signed == 3
+
+
+def test_the_token_signs_one_file_at_a_time_while_the_next_downloads():
+    events, session = [], _Session(delay=0.05)
+    files = [_pdf_job("d%d" % i, "f%d.pdf" % i, b"file %d" % i) for i in range(4)]
+    fetching_next = threading.Event()
+    overlapped = []
+    plain_sign = session.sign
+
+    def sign(content, summary):
+        if summary["filename"] == "f0.pdf":                 # the next download is already under way
+            overlapped.append(fetching_next.wait(2))
+        return plain_sign(content, summary)
+
+    session.sign = sign
+    link, _cls, _opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 4}],
+        "claim_jobs": _claim_of(files),
+        "job_content": {job["id"]: {"job": job} for _pdf, job in files},
+        "on_content": lambda job_id: job_id == "d1" and fetching_next.set(),
+    }, events, session)
+    link._beat()
+    assert overlapped == [True]
+    assert session.most_at_once == 1                                          # never two signatures at once
+    assert session.signed == ["f0.pdf", "f1.pdf", "f2.pdf", "f3.pdf"] and link.jobs_signed == 4
+
+
+def test_one_bad_file_does_not_stop_the_run():
+    events = []
+    session = _Session(fail={"f2.pdf": remote.SignError("failed", "The token said no.")})
+    files = [_pdf_job("d%d" % i, "f%d.pdf" % i, b"file %d" % i) for i in range(3)]
+    link, cls, _opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 3}],
+        "claim_jobs": _claim_of(files),
+        # d1's file was deleted after the code was typed: Broto failed that job itself.
+        "job_content": {"d0": {"job": files[0][1]}, "d1": {"job": None}, "d2": {"job": files[2][1]}},
+    }, events, session)
+    link._beat()
+    assert session.signed == ["f0.pdf"]
+    posted = {c[3]["job_id"]: c[3] for c in cls.calls if c[0] == "post_result"}
+    assert set(posted) == {"d0", "d2"}                                        # nothing to hand back for d1
+    assert posted["d0"]["ok"] and (posted["d2"]["code"], posted["d2"]["message"]) == ("failed", "The token said no.")
+    assert sorted(e for e, _ in events if e.startswith("job_")) == ["job_failed", "job_signed"]
+    assert events[-1] == ("run_done", {"signed": 1, "failed": 2, "seconds": events[-1][1]["seconds"]})
+
+
+def test_a_network_blip_while_fetching_is_retried_once():
+    events, session = [], _Session()
+    blip = remote.RemoteError("network", "Couldn't reach Broto (timeout).")
+    files = [_pdf_job("d0", "f0.pdf"), _pdf_job("d1", "f1.pdf", b"two")]
+    link, cls, _opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 2}],
+        "claim_jobs": _claim_of(files),
+        "job_content": {"d0": [blip, {"job": files[0][1]}], "d1": [blip, blip]},
+    }, events, session)
+    link._beat()
+    assert session.signed == ["f0.pdf"]
+    assert [c[3]["job_id"] for c in cls.calls if c[0] == "job_content"].count("d1") == 2   # once more, then given up
+    failed = [c[3] for c in cls.calls if c[0] == "post_result" and not c[3]["ok"]]
+    assert [(f["job_id"], f["code"]) for f in failed] == [("d1", "network")]
+
+
+def test_a_file_broto_refuses_is_not_counted_as_signed():
+    events, session = [], _Session()
+    _pdf, job = _pdf_job("d0")
+    link, _cls, _opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 1}],
+        "claim_jobs": [{"jobs": [{"id": "d0", "kind": "document"}]}],
+        "job_content": {"d0": {"job": job}},
+        "post_result": [{"ok": True, "status": "failed", "error_code": "cert_mismatch",
+                         "error_message": "Signed with the wrong certificate."}],
+    }, events, session)
+    link._beat()
+    assert link.jobs_signed == 0
+    assert events[-1] == ("job_failed", {"job": job, "summary": events[-1][1]["summary"], "code": "cert_mismatch",
+                                         "message": "Signed with the wrong certificate."})
+    assert "run_done" not in [e for e, _ in events]                          # a run of one file reports per file
+
+
+def test_an_older_broto_hands_out_files_one_at_a_time_and_the_token_logs_in_once():
+    events, session = [], _Session()
+    files = [_pdf_job("d0", "f0.pdf"), _pdf_job("d1", "f1.pdf", b"two")]
+    link, cls, opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 2}],
+        "next_job": [{"job": files[0][1]}, {"job": files[1][1]}, {"job": None}],
+    }, events, session)                                       # no claim_jobs script = 404, like an older Broto
+    link._beat()
+    assert opened == [session] and session.closed == 1 and session.signed == ["f0.pdf", "f1.pdf"]
+    assert [c[0] for c in cls.calls].count("next_job") == 3
+    assert all("timings" not in c[3] for c in cls.calls if c[0] == "post_result")
+
+
+def test_a_claim_that_fails_leaves_the_jobs_for_the_next_check_in():
+    events = []
+    link, cls, opened = _run_link({
+        "heartbeat": [{"ok": True, "jobs_waiting": 1}],
+        "claim_jobs": [remote.RemoteError("network", "Couldn't reach Broto (timeout).")],
+    }, events, _Session())
+    link._beat()
+    assert opened == [] and link.last_error == "Couldn't reach Broto (timeout)."
+    assert "next_job" not in [c[0] for c in cls.calls]
+
+
+def test_broto_may_ask_for_a_2_second_pace_while_a_code_is_typed():
+    link, _cls = _paired_link({"heartbeat": [{"ok": True, "heartbeat_interval_s": 2},
+                                             {"ok": True, "heartbeat_interval_s": 1}]}, [])
+    link._beat()
+    assert link.interval_s == 2
+    link._beat()
+    assert link.interval_s == 2                                               # under the floor: ignored
+
+
+def test_client_claims_a_run_fetches_one_file_and_reports_timings():
+    seen = []
+
+    def opener(req, timeout=None):
+        seen.append((req.full_url, json.loads(req.data.decode()), req.get_header("Authorization")))
+        return _Resp(200, {"jobs": []})
+
+    c = remote.RemoteClient("https://api.example", token="tok", opener=opener)
+    c.claim_jobs(10)
+    c.job_content("abc")
+    c.post_result("abc", signed=b"x", timings={"fetch_ms": 12.7, "sign_ms": 3, "bad": "no"})
+    assert seen[0][:2] == ("https://api.example/api/cha/signer-devices/jobs/claim", {"max": 10})
+    assert seen[1][:2] == ("https://api.example/api/cha/signer-devices/jobs/abc/content", {})
+    assert seen[2][1]["timings"] == {"fetch_ms": 12, "sign_ms": 3} and all(s[2] == "Bearer tok" for s in seen)
 
 
 # ------------------------------------------------------------ token store

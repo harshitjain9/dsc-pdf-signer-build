@@ -55,8 +55,10 @@ APP_TITLE = "Broto DSC Signer"
 # 2.3.4 = a remote job is signed with the certificate of the job's ICEGATE ID (Broto names it), and the PIN is
 #         saved per token — a PIN is never tried on another token (published alone for a few minutes, never installed);
 # 2.4.0 = Broto login screen (only Broto users), "Relaunch to update", PDFs pyHanko's strict mode refused now sign;
-# 2.4.1 = 2.4.0 + 2.3.4 (the certificate of the job's ICEGATE ID, one saved PIN per token).
-APP_VERSION = "2.4.1"
+# 2.4.1 = 2.4.0 + 2.3.4 (the certificate of the job's ICEGATE ID, one saved PIN per token);
+# 2.5.0 = faster remote runs (Sign & eSANCHIT): the whole run is taken at once, the token is logged in once
+#         for it and still signs one file at a time, while the next files download and signed ones go back.
+APP_VERSION = "2.5.0"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -207,6 +209,19 @@ class FileRow(ctk.CTkFrame):
         else:
             self.status.configure(text="Ready", text_color=MUTED)
             self.detail.configure(text=os.path.dirname(self.path), text_color=MUTED)
+
+
+def _timing_note(timings) -> str:
+    """How long each step of a remote file took, for the Activity log — e.g.
+    ' (got it in 0.8 s · signed in 1.1 s · sent back in 1.9 s)'; '' when not measured."""
+    if not isinstance(timings, dict):
+        return ""
+    parts = []
+    for key, text in (("fetch_ms", "got it in"), ("sign_ms", "signed in"), ("send_ms", "sent back in")):
+        value = timings.get(key)
+        if isinstance(value, (int, float)):
+            parts.append("%s %.1f s" % (text, value / 1000.0))
+    return (" (%s)" % " · ".join(parts)) if parts else ""
 
 
 def _fmt_job_date(raw: str) -> str:
@@ -501,6 +516,152 @@ class LoginScreen:
 
 
 # ------------------------------------------------------------------ app
+class RemoteSignSession:
+    """One run of remote signing jobs on this PC (heartbeat thread — no Tk here).
+
+    The token is opened and logged in ONCE per certificate, and every file of
+    the run is signed in that same session, one after another: a token chip
+    signs one file at a time, and every extra login is one more chance to lock
+    it. The token lock is held from the first signature until ``close()``, so a
+    local Sign or a one-click filing waits for the run (seconds) instead of
+    cutting into it. A token that refuses its saved PIN is never tried again in
+    the run: every file that needs it fails at once with the same reason.
+
+    Which certificate signs: the one Broto names for the job (``cert_thumbprint``
+    — the one set for the job's ICEGATE ID), else the one picked in this app.
+    Its PIN is the one saved for THAT certificate's token — never another
+    token's (a wrong try counts towards locking it)."""
+
+    def __init__(self, app: "SignerApp") -> None:
+        self.app = app
+        self.ctx = dict(app._remote_ctx)
+        self.pins: Dict[str, str] = dict(self.ctx.get("pins") or {})
+        self._listed: Dict[tuple, List[CertInfo]] = {}     # (driver, named?) → its certificates, read once
+        self._signers: Dict[tuple, DscSigner] = {}         # certificate → its open, logged-in token session
+        self._refused: Dict[str, tuple] = {}               # token → (code, message) its login was refused with
+        self._locked = False
+
+    def sign(self, content: bytes, summary: dict) -> bytes:
+        ctx, pins = self.ctx, self.pins
+        named = str((summary or {}).get("cert_thumbprint") or "").lower()
+        whose = ("%s's certificate" % summary["cert_holder"]) if (summary or {}).get("cert_holder") else \
+            "the certificate Broto asked for"
+        if named:
+            entry = next((c for c in ctx.get("certs") or [] if c.get("thumbprint") == named), {})
+            module = entry.get("module") or ctx.get("module") or ""
+        else:
+            module = ctx.get("cert_module") or ctx.get("module") or ""
+            picked = ctx.get("picked_token") or ""
+            if not (pins.get(picked) if picked else None) and not pins.get(""):
+                raise SignError("pin_not_saved", "This PC has no saved token PIN. Open the Broto Signer here and tick "
+                                                 "“Remember my PIN on this computer”.")
+        if not module or not os.path.exists(module):
+            raise SignError("driver_missing", "The token driver isn't set on this PC — open the Broto Signer's Settings here.")
+        use = None
+        try:
+            self._hold_token()
+            use, pin = self._choose(module, named, whose)
+            token = use.token or "%s#%d" % (module, use.slot_index)
+            if token in self._refused:
+                raise SignError(*self._refused[token])
+            key = (module, use.slot_index, bytes(use.cert_id or b""), use.label or "")
+            signer = self._signers.get(key)
+            if signer is None:
+                try:
+                    signer = DscSigner(module, pin, cert_id=use.cert_id, cert_label=use.label,
+                                       slot_index=use.slot_index)
+                except Exception as e:  # noqa: BLE001
+                    err = self._error_for(e, use)
+                    if err.code in ("wrong_pin", "pin_locked"):
+                        self._refused[token] = (err.code, err.message)   # never type that PIN again this run
+                    raise err
+                self._signers[key] = signer
+            try:
+                fmt = (summary or {}).get("format")
+                if fmt == "pdf":
+                    return signer.sign_pdf_bytes(content)     # PAdES, incremental update
+                if fmt == "flatfile":
+                    return signer.sign_flatfile_bytes(content)  # ICEGATE tag envelope
+                return signer.sign_icegate_json_bytes(content)
+            except Exception:
+                self._drop(key)          # the session may be broken now: the next file opens a fresh one
+                raise
+        except SignError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise self._error_for(e, use)
+
+    def close(self) -> None:
+        for key in list(self._signers):
+            self._drop(key)
+        if self._locked:
+            self._locked = False
+            self.app._token_lock.release()
+
+    # ---------------------------------------------------------------- helpers
+    def _hold_token(self) -> None:
+        if not self._locked:
+            self.app._token_lock.acquire()
+            self._locked = True
+
+    def _drop(self, key: tuple) -> None:
+        signer = self._signers.pop(key, None)
+        if signer is not None:
+            signer.close()
+
+    def _certificates(self, module: str, named: bool) -> List[CertInfo]:
+        key = (module, bool(named))
+        if key not in self._listed:
+            # Each token that hides its certificates gets only its own saved PIN here.
+            self._listed[key] = list_certificates(module, None if named else self.pins.get(""), pins=self.pins)
+        return self._listed[key]
+
+    def _choose(self, module: str, named: str, whose: str):
+        """The certificate that signs this job and its token's saved PIN."""
+        ctx, pins = self.ctx, self.pins
+        listed = self._certificates(module, bool(named))
+        if named:
+            use = next((c for c in listed if (c.thumbprint or "").lower() == named), None)
+            if use is None:
+                raise SignError("cert_missing", "%s%s isn't on this PC's tokens. Plug in that token here, "
+                                                "then try again." % (whose[:1].upper(), whose[1:]))
+            pin = pins.get(use.token)
+            if not pin:
+                raise SignError("pin_not_saved", "No PIN is saved on this PC for the token with %s. Open the "
+                                                 "Broto Signer here, pick that certificate, type its PIN and "
+                                                 "tick “Remember my PIN on this computer”." % whose)
+            return use, pin
+        if not listed:
+            raise SignError("token_missing", "No certificate found on the token — is it plugged into this PC?")
+        want, want_thumb = ctx.get("cert_id"), ctx.get("cert_thumbprint")
+        match = ([c for c in listed if want_thumb and c.thumbprint == want_thumb]
+                 or [c for c in listed if want and c.cert_id.hex() == want])
+        if match:
+            use = match[0]
+        elif len(listed) == 1:
+            use = listed[0]
+        else:
+            raise SignError("cert_ambiguous", "This token has %d certificates — pick one in the Broto "
+                                              "Signer on this PC, then try again." % len(listed))
+        pin = pins.get(use.token) or pins.get("")
+        if not pin:
+            raise SignError("pin_not_saved", "No PIN is saved on this PC for the token with the certificate "
+                                             "picked here. Open the Broto Signer here and tick “Remember "
+                                             "my PIN on this computer”.")
+        return use, pin
+
+    def _error_for(self, exc: BaseException, use: Optional[CertInfo]) -> SignError:
+        kind = pin_error_kind(exc)
+        if kind == "wrong":
+            # Forget that token's saved PIN on the UI thread ("" = the one an older Signer saved).
+            self.app.q.put(("remote", "pin_rejected", (use.token if use is not None else "") or ""))
+            return SignError("wrong_pin", "The token rejected the PIN saved on this PC, so it was removed — "
+                                          "enter the PIN again in the Broto Signer there.")
+        if kind == "locked":
+            return SignError("pin_locked", "The DSC token on this PC is locked. Unlock it with the token's own tool.")
+        return SignError("failed", (str(exc) or repr(exc))[:300])
+
+
 class SignerApp:
     def __init__(self, root: _Root, account: Account) -> None:
         self.root = root
@@ -538,7 +699,7 @@ class SignerApp:
         self._remote_ctx: dict = {}              # driver path + chosen certificate, for signing off-thread
         self.remote = RemoteLink(report_fn=self._remote_report,
                                  notify=lambda ev, payload: self.q.put(("remote", ev, payload)),
-                                 sign_fn=self._sign_for_remote)
+                                 sign_fn=self._sign_for_remote, session_fn=self._remote_session)
         self._quitting = False
         self.updater = Updater(APP_VERSION, account.api_base, token_fn=lambda: self.account.token,
                                notify=lambda ev, info: self.q.put(("update", ev, info)))
@@ -770,86 +931,19 @@ class SignerApp:
         """Built on the heartbeat thread from the UI-thread snapshot — never touches Tk."""
         return device_report(dict(self._status_snapshot), APP_VERSION)
 
-    def _sign_for_remote(self, content: bytes, summary: dict) -> bytes:
-        """Sign for a request relayed by Broto (heartbeat thread — no Tk here).
+    def _remote_session(self) -> "RemoteSignSession":
+        """A run of remote jobs (remote.py, heartbeat thread): one token login for all of them."""
+        return RemoteSignSession(self)
 
-        When Broto names a certificate (``cert_thumbprint``: the one set for the
-        job's ICEGATE ID) exactly that one signs; otherwise the certificate
-        picked in this app. The PIN is the one saved for THAT certificate's
-        token — never another token's (a wrong try counts towards locking it).
-        The token lock serialises this with local signing. Raises SignError with
-        a code Broto shows the person who asked."""
-        ctx = dict(self._remote_ctx)
-        pins = dict(ctx.get("pins") or {})
-        named = str((summary or {}).get("cert_thumbprint") or "").lower()
-        whose = ("%s's certificate" % summary["cert_holder"]) if (summary or {}).get("cert_holder") else \
-            "the certificate Broto asked for"
-        if named:
-            entry = next((c for c in ctx.get("certs") or [] if c.get("thumbprint") == named), {})
-            module = entry.get("module") or ctx.get("module") or ""
-        else:
-            module = ctx.get("cert_module") or ctx.get("module") or ""
-            picked = ctx.get("picked_token") or ""
-            if not (pins.get(picked) if picked else None) and not pins.get(""):
-                raise SignError("pin_not_saved", "This PC has no saved token PIN. Open the Broto Signer here and tick "
-                                                 "“Remember my PIN on this computer”.")
-        if not module or not os.path.exists(module):
-            raise SignError("driver_missing", "The token driver isn't set on this PC — open the Broto Signer's Settings here.")
-        want, want_thumb = ctx.get("cert_id"), ctx.get("cert_thumbprint")
-        use = None
+    def _sign_for_remote(self, content: bytes, summary: dict) -> bytes:
+        """Sign ONE request relayed by Broto (heartbeat thread — no Tk here): a
+        run of one file. Raises SignError with a code Broto shows the person who
+        asked."""
+        session = self._remote_session()
         try:
-            with self._token_lock:
-                # Each token that hides its certificates gets only its own saved PIN here.
-                listed = list_certificates(module, None if named else pins.get(""), pins=pins)
-                if named:
-                    use = next((c for c in listed if (c.thumbprint or "").lower() == named), None)
-                    if use is None:
-                        raise SignError("cert_missing", "%s%s isn't on this PC's tokens. Plug in that token here, "
-                                                        "then try again." % (whose[:1].upper(), whose[1:]))
-                    pin = pins.get(use.token)
-                    if not pin:
-                        raise SignError("pin_not_saved", "No PIN is saved on this PC for the token with %s. Open the "
-                                                         "Broto Signer here, pick that certificate, type its PIN and "
-                                                         "tick “Remember my PIN on this computer”." % whose)
-                else:
-                    if not listed:
-                        raise SignError("token_missing", "No certificate found on the token — is it plugged into this PC?")
-                    match = ([c for c in listed if want_thumb and c.thumbprint == want_thumb]
-                             or [c for c in listed if want and c.cert_id.hex() == want])
-                    if match:
-                        use = match[0]
-                    elif len(listed) == 1:
-                        use = listed[0]
-                    else:
-                        raise SignError("cert_ambiguous", "This token has %d certificates — pick one in the Broto "
-                                                          "Signer on this PC, then try again." % len(listed))
-                    pin = pins.get(use.token) or pins.get("")
-                    if not pin:
-                        raise SignError("pin_not_saved", "No PIN is saved on this PC for the token with the certificate "
-                                                         "picked here. Open the Broto Signer here and tick “Remember "
-                                                         "my PIN on this computer”.")
-                signer = DscSigner(module, pin, cert_id=use.cert_id, cert_label=use.label, slot_index=use.slot_index)
-                try:
-                    fmt = (summary or {}).get("format")
-                    if fmt == "pdf":
-                        return signer.sign_pdf_bytes(content)     # PAdES, incremental update
-                    if fmt == "flatfile":
-                        return signer.sign_flatfile_bytes(content)  # ICEGATE tag envelope
-                    return signer.sign_icegate_json_bytes(content)
-                finally:
-                    signer.close()
-        except SignError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            kind = pin_error_kind(e)
-            if kind == "wrong":
-                # Forget that token's saved PIN on the UI thread ("" = the one an older Signer saved).
-                self.q.put(("remote", "pin_rejected", (use.token if use is not None else "") or ""))
-                raise SignError("wrong_pin", "The token rejected the PIN saved on this PC, so it was removed — "
-                                             "enter the PIN again in the Broto Signer there.")
-            if kind == "locked":
-                raise SignError("pin_locked", "The DSC token on this PC is locked. Unlock it with the token's own tool.")
-            raise SignError("failed", (str(e) or repr(e))[:300])
+            return session.sign(content, summary)
+        finally:
+            session.close()
 
     def _on_remote_event(self, event: str, payload) -> None:
         if event == "paired":
@@ -894,16 +988,24 @@ class SignerApp:
                 tail = "Broto stored it on the job for download and portal upload."
             else:
                 tail = "Broto is filing it."
-            self._log("✓ Signed %s for job %s remotely — asked by %s. %s" % (what, s.get("job_number"), who, tail))
+            self._log("✓ Signed %s for job %s remotely — asked by %s. %s%s"
+                      % (what, s.get("job_number"), who, tail, _timing_note(p.get("timings"))))
             self._flash("✓  Signed %s (job %s) remotely for %s" % (what, s.get("job_number"), who), OK)
             if self.root.state() == "iconic":
                 pass                                   # stay out of the way — the log has the details
         elif event == "job_failed":
             p = payload if isinstance(payload, dict) else {}
             s, job = p.get("summary") or {}, p.get("job") or {}
-            self._log("Remote signing request for job %s failed (%s): %s"
-                      % (s.get("job_number") or job.get("job_seq"), p.get("code"), p.get("message")))
+            number = s.get("job_number") or job.get("job_seq")
+            self._log("Remote signing request%s failed (%s): %s"
+                      % ((" for job %s" % number) if number else "", p.get("code"), p.get("message")))
             self._flash("Couldn't sign a remote request — see Activity log", ERR)
+        elif event == "run_done":
+            p = payload if isinstance(payload, dict) else {}
+            signed, failed = int(p.get("signed") or 0), int(p.get("failed") or 0)
+            self._log("Remote run done: %d file%s signed%s in %s s."
+                      % (signed, "" if signed == 1 else "s", (", %d failed" % failed) if failed else "",
+                         p.get("seconds")))
         elif event == "pin_rejected":
             token = payload if isinstance(payload, str) else ""
             if token in self._pins:
