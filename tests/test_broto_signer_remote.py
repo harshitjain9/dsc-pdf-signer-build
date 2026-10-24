@@ -869,10 +869,9 @@ def test_pairing_a_second_firm_never_touches_the_first():
                                         "firm_name": "Firm B", "device_name": "OFFICE-PC"}]}, events, 1)
     second.pair("ABCD-EFGH")
     st = secure_store.load_settings()
-    assert st["remote_token_plain"] == "tok-1" and st["remote_device_id"] == "d1"
-    assert st["remote_firm_name"] == "Firm A"
-    assert st["remote_token_plain_2"] == "tok-2" and st["remote_device_id_2"] == "d2"
-    assert st["remote_firm_name_2"] == "Firm B"
+    assert st["remote_device_id"] == "d1" and st["remote_firm_name"] == "Firm A"
+    assert st["remote_device_id_2"] == "d2" and st["remote_firm_name_2"] == "Firm B"
+    # Tokens are read through the store: on Windows they are kept DPAPI-protected, never under the plain keys.
     assert secure_store.load_remote_token(0) == "tok-1" and secure_store.load_remote_token(1) == "tok-2"
     assert events[-1][0] == "paired" and events[-1][1]["slot"] == 1
     # A fresh start reads both firms back.
