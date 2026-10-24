@@ -199,17 +199,25 @@ def remote_token_protected() -> bool:
     return sys.platform == "win32"
 
 
-def save_remote_token(token: str) -> None:
+# Each firm this PC is paired with has its own slot: slot 0 keeps the original
+# keys (so a PC paired before two-firm pairing reads its token as before), slot 1
+# the same keys ending in "_2".
+def remote_key(name: str, slot: int = 0) -> str:
+    return name if not slot else "%s_%d" % (name, slot + 1)
+
+
+def save_remote_token(token: str, slot: int = 0) -> None:
+    dpapi, plain = remote_key("remote_token_dpapi", slot), remote_key("remote_token_plain", slot)
     if remote_token_protected():
         blob = _protect(token.encode("utf-8"), _REMOTE_ENTROPY, "Broto Signer remote token")
-        update_settings(remote_token_dpapi=base64.b64encode(blob).decode("ascii"), remote_token_plain=None)
+        update_settings(**{dpapi: base64.b64encode(blob).decode("ascii"), plain: None})
     else:
-        update_settings(remote_token_plain=token, remote_token_dpapi=None)
+        update_settings(**{plain: token, dpapi: None})
 
 
-def load_remote_token() -> Optional[str]:
+def load_remote_token(slot: int = 0) -> Optional[str]:
     data = load_settings()
-    raw = data.get("remote_token_dpapi")
+    raw = data.get(remote_key("remote_token_dpapi", slot))
     if raw:
         if not remote_token_protected():
             return None
@@ -217,17 +225,17 @@ def load_remote_token() -> Optional[str]:
             return _unprotect(base64.b64decode(raw), _REMOTE_ENTROPY).decode("utf-8")
         except Exception:  # noqa: BLE001 - other user / other PC / corrupt → not paired
             return None
-    plain = data.get("remote_token_plain")
+    plain = data.get(remote_key("remote_token_plain", slot))
     return str(plain) if plain else None
 
 
-def has_remote_token() -> bool:
+def has_remote_token(slot: int = 0) -> bool:
     data = load_settings()
-    return bool(data.get("remote_token_dpapi") or data.get("remote_token_plain"))
+    return bool(data.get(remote_key("remote_token_dpapi", slot)) or data.get(remote_key("remote_token_plain", slot)))
 
 
-def forget_remote_token() -> None:
-    update_settings(remote_token_dpapi=None, remote_token_plain=None)
+def forget_remote_token(slot: int = 0) -> None:
+    update_settings(**{remote_key("remote_token_dpapi", slot): None, remote_key("remote_token_plain", slot): None})
 
 
 # ------------------------------------------------------------ Broto login (account.py)

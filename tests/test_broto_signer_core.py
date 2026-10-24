@@ -27,6 +27,40 @@ def test_default_module_prefers_a_driver_that_is_installed(monkeypatch):
     assert core.default_module() == epass
 
 
+def test_proxkey_driver_in_its_watchdata_folder_is_found_after_the_default(monkeypatch):
+    """A PC with the WD ProxKey software but no SignatureP11.dll (2026-10-24): Watchdata's own
+    driver in its version folder is found, newest version first, ahead of other makes."""
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    v2 = r"C:\Windows\System32\Watchdata\PROXKey CSP India V2.0\wdpkcs.dll"
+    v3 = r"C:\Windows\System32\Watchdata\PROXKey CSP India V3.0\wdpkcs.dll"
+    epass = r"C:\Windows\System32\eps2003csp11v2.dll"
+    monkeypatch.setattr(core.glob, "glob", lambda pattern: [v2, v3] if pattern == core._WATCHDATA_MODULES else [])
+    monkeypatch.setattr(core.os.path, "exists", lambda p: p in (v2, v3, epass))
+    assert core.discover_modules() == [v3, v2, epass]
+    assert core.default_module() == v3
+    monkeypatch.setattr(core.os.path, "exists", lambda p: p in (core.DEFAULT_WINDOWS_MODULE, v3, epass))
+    assert core.discover_modules() == [core.DEFAULT_WINDOWS_MODULE, v3, epass]   # SignatureP11 stays first
+
+
+def test_a_driver_in_its_own_folder_loads_with_that_folder_on_path(monkeypatch):
+    """python-pkcs11 loads a driver with a plain LoadLibraryW, which never looks in the driver's
+    own folder for the DLLs it needs — so that folder goes on PATH first, once."""
+    import types
+    seen = []
+    mod = types.ModuleType("pkcs11")
+    mod.lib = lambda so: seen.append((so, os.environ["PATH"])) or "lib"
+    monkeypatch.setitem(sys.modules, "pkcs11", mod)
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("PATH", "system32")
+    folder = os.path.join("Watchdata", "PROXKey CSP India V3.0")
+    driver = os.path.join(folder, "wdpkcs.dll")
+    assert core._open_lib(driver) == "lib"
+    assert core._open_lib(driver) == "lib"
+    assert seen == [(driver, folder + os.pathsep + "system32")] * 2     # added once, not twice
+    assert core._open_lib("SignatureP11.dll") == "lib"                   # no folder: PATH unchanged
+    assert os.environ["PATH"] == folder + os.pathsep + "system32"
+
+
 # ------------------------------------------------------------ several tokens
 def _cert(name, thumb, module="", can_sign=True, serial="", not_after=None, slot=0):
     return CertInfo(label="", subject="CN=" + name, common_name=name, thumbprint=thumb, module=module,
@@ -367,3 +401,18 @@ def test_a_typed_pin_still_opens_a_hiding_token_that_has_no_saved_pin(monkeypatc
     opened = _fake_pkcs11(monkeypatch, [[a]], serials={0: "A"}, hidden={0: "1111"})
     certs = core.list_certificates("x.dll", "1111")
     assert [c.common_name for c in certs] == ["HOLDER ONE"] and opened == {0: [None, "1111"]}
+
+
+def test_present_token_keys_are_the_keys_the_certificates_carry(monkeypatch):
+    """The heartbeat probe (2.6.1) names plugged-in tokens exactly as the certificate
+    listing does — a serial when the token has one, else its slot + label — so
+    "is the token of this certificate in?" is a plain set lookup. No session, no PIN."""
+    a = _der("A", "CA", 1)
+    opened = _fake_pkcs11(monkeypatch, [[a], [a]], serials={0: "SERIAL-A"})
+    keys = core.present_token_keys("x.dll")
+    assert keys == {"sn:SERIAL-A", "slot1:TOKEN 1"}
+    assert opened == {0: [], 1: []}                       # the probe opens no token session
+    assert {c.token for c in core.list_certificates("x.dll")} <= keys
+
+    _fake_pkcs11(monkeypatch, [])
+    assert core.present_token_keys("x.dll") == set()

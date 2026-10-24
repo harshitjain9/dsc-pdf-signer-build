@@ -39,9 +39,10 @@ except Exception:  # noqa: BLE001
 import secure_store as store
 from account import REFRESH_INTERVAL_S, Account, ApiError, login_error_message
 from bridge import BRIDGE_PORT, BridgeServer, SignRequest
-from remote import DEFAULT_API_BASE, RemoteLink, SignError, default_api_base, device_report
+from remote import DEFAULT_API_BASE, MAX_FIRMS, RemoteLink, SignError, default_api_base, device_report
 from signer_core import (CertInfo, DscSigner, cert_choice_labels, default_module, discover_module,
-                         list_all_certificates, list_certificates, make_batch_folder, pin_error_kind, sign_one)
+                         list_all_certificates, list_certificates, make_batch_folder, pin_error_kind,
+                         present_token_keys, sign_one)
 from updater import Updater, relaunch_command, spawn
 
 APP_TITLE = "Broto DSC Signer"
@@ -58,7 +59,14 @@ APP_TITLE = "Broto DSC Signer"
 # 2.4.1 = 2.4.0 + 2.3.4 (the certificate of the job's ICEGATE ID, one saved PIN per token);
 # 2.5.0 = faster remote runs (Sign & eSANCHIT): the whole run is taken at once, the token is logged in once
 #         for it and still signs one file at a time, while the next files download and signed ones go back.
-APP_VERSION = "2.5.0"
+# 2.6.0 = one PC (and its DSC) paired with two Broto firms at once — "Add another firm" in Remote signing.
+# 2.6.1 = every check-in tells Broto whether the token is plugged in RIGHT NOW (asked from the driver), not
+#         whether Connect once worked — so a firm that moves its one token between PCs signs on the PC that
+#         holds it. Broto Signer 2.6.1 is the first that reports an unplugged token.
+# 2.6.2 = finds ProxKey's own driver, System32\Watchdata\<version folder>\wdpkcs.dll, on a PC without
+#         SignatureP11.dll (the WD ProxKey tool showed the certificate, the Signer found no driver), and
+#         puts a driver's own folder on PATH before loading it, so the helper DLLs next to it are found.
+APP_VERSION = "2.6.2"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -694,12 +702,16 @@ class SignerApp:
         self._token_lock = threading.Lock()     # one token session at a time (batch vs bridge)
         self._approval: Optional[ApprovalDialog] = None
         self._status_snapshot: dict = {}         # read by the bridge + remote threads; written on the UI thread
-        # Remote signing (remote.py): pairing state + heartbeat thread. Built before the
-        # UI so Settings can show its state; the thread starts after the first refresh.
+        # Remote signing (remote.py): pairing state + heartbeat thread, one per firm this
+        # PC is paired with (slot 0 = the original pairing). Built before the UI so
+        # Settings can show their state; the threads start after the first refresh.
         self._remote_ctx: dict = {}              # driver path + chosen certificate, for signing off-thread
-        self.remote = RemoteLink(report_fn=self._remote_report,
-                                 notify=lambda ev, payload: self.q.put(("remote", ev, payload)),
-                                 sign_fn=self._sign_for_remote, session_fn=self._remote_session)
+        self._adding_firm = False                # "Add another firm" opened the code box
+        self.remotes: List[RemoteLink] = [
+            RemoteLink(report_fn=self._remote_report,
+                       notify=lambda ev, payload, slot=slot: self.q.put(("remote", ev, payload, slot)),
+                       sign_fn=self._sign_for_remote, session_fn=self._remote_session, slot=slot)
+            for slot in range(MAX_FIRMS)]
         self._quitting = False
         self.updater = Updater(APP_VERSION, account.api_base, token_fn=lambda: self.account.token,
                                notify=lambda ev, info: self.q.put(("update", ev, info)))
@@ -709,7 +721,8 @@ class SignerApp:
                                    status=lambda: dict(self._status_snapshot))
         self.bridge_ok = self.bridge.start()
         self._refresh()
-        self.remote.start()
+        for link in self.remotes:
+            link.start()
         self.updater.start()
         threading.Thread(target=self._session_loop, name="broto-session", daemon=True).start()
         self._poll()
@@ -724,10 +737,11 @@ class SignerApp:
             self._log("One-click filing ready — Broto can ask this app for signatures (port %d)." % BRIDGE_PORT)
         else:
             self._log("One-click filing is OFF: " + (self.bridge.error or "could not start"))
-        if self.remote.paired:
+        paired = [link for link in self.remotes if link.paired]
+        for link in paired:
             self._log("Remote signing: paired with %s as %s — checking in with Broto…"
-                      % (self.remote.firm_name or "Broto", self.remote.device_name or "this PC"))
-        else:
+                      % (link.firm_name or "Broto", link.device_name or "this PC"))
+        if not paired:
             self._log("Remote signing is off — pair this PC in Settings so your team can sign from anywhere.")
         if store.has_saved_pin() and not self._pins:
             store.forget_pin()   # saved under another Windows login / PC — useless here
@@ -883,53 +897,109 @@ class SignerApp:
                      anchor="w").grid(row=0, column=0, columnspan=2, sticky="w")
         hint = ("Let your team sign from anywhere while this PC stays on with the token plugged in. "
                 "In Broto: Settings ▸ DSC computers ▸ Add computer, then type the code here.")
-        if self.remote.api_base.rstrip("/") != DEFAULT_API_BASE:
-            hint += "  Server: " + self.remote.api_base
+        if self.remotes[0].api_base.rstrip("/") != DEFAULT_API_BASE:
+            hint += "  Server: " + self.remotes[0].api_base
         ctk.CTkLabel(box, text=hint, text_color=MUTED, font=_font(11), anchor="w", justify="left",
                      wraplength=290).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
         self.pair_entry = ctk.CTkEntry(box, height=32, corner_radius=8, placeholder_text="Pairing code, e.g. ABCD-EFGH",
                                        fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=_font(12))
         self.pair_entry.bind("<Return>", lambda _e: self._pair_remote())
         self.pair_btn = secondary_button(box, "Connect", self._pair_remote, width=84)
-        self.remote_lbl = ctk.CTkLabel(box, text="", text_color=TEXT, font=_font(12), anchor="w",
-                                       justify="left", wraplength=200)
-        self.unpair_btn = secondary_button(box, "Disconnect", self._unpair_remote, width=94)
+        # One "Connected to … [Disconnect]" line per firm (rows 2 and 3), then the
+        # code box — or, while a firm is connected, "Add another firm" that opens it.
+        self.remote_lbls = [ctk.CTkLabel(box, text="", text_color=TEXT, font=_font(12), anchor="w",
+                                         justify="left", wraplength=200) for _ in self.remotes]
+        self.unpair_btns = [secondary_button(box, "Disconnect", lambda slot=slot: self._unpair_remote(slot),
+                                             width=94) for slot in range(len(self.remotes))]
+        self.add_firm_btn = secondary_button(box, "Add another firm", self._add_firm, width=140)
         self.remote_msg = ctk.CTkLabel(box, text="", text_color=MUTED, font=_font(11), anchor="w",
                                        justify="left", wraplength=290)
-        self.remote_msg.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.remote_msg.grid(row=2 + len(self.remotes) + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._layout_remote()
 
     def _layout_remote(self) -> None:
-        for w in (self.pair_entry, self.pair_btn, self.remote_lbl, self.unpair_btn):
+        for w in [self.pair_entry, self.pair_btn, self.add_firm_btn] + self.remote_lbls + self.unpair_btns:
             w.grid_forget()
-        if self.remote.paired:
-            st = self.remote.status()
-            self.remote_lbl.configure(text="Connected to %s as %s" % (st.get("firm_name") or "Broto",
-                                                                    st.get("device_name") or "this PC"))
-            self.remote_lbl.grid(row=2, column=0, sticky="ew")
-            self.unpair_btn.grid(row=2, column=1, padx=(6, 0))
+        paired = [link for link in self.remotes if link.paired]
+        for row, link in enumerate(paired, start=2):
+            st = link.status()
+            self.remote_lbls[link.slot].configure(text="Connected to %s as %s" % (
+                st.get("firm_name") or "Broto", st.get("device_name") or "this PC"))
+            self.remote_lbls[link.slot].grid(row=row, column=0, sticky="ew", pady=(0, 4))
+            self.unpair_btns[link.slot].grid(row=row, column=1, padx=(6, 0), pady=(0, 4))
+        if len(paired) == len(self.remotes):
+            self._adding_firm = False
+            return
+        code_row = 2 + len(self.remotes)
+        if not paired or self._adding_firm:
+            self.pair_entry.grid(row=code_row, column=0, sticky="ew")
+            self.pair_btn.grid(row=code_row, column=1, padx=(6, 0))
         else:
-            self.pair_entry.grid(row=2, column=0, sticky="ew")
-            self.pair_btn.grid(row=2, column=1, padx=(6, 0))
+            self.add_firm_btn.grid(row=code_row, column=0, sticky="w")
+
+    def _add_firm(self) -> None:
+        """Open the code box to pair this PC with one more Broto firm."""
+        self._adding_firm = True
+        self._layout_remote()
+        self.pair_entry.focus_set()
+
+    def _free_remote(self) -> Optional[RemoteLink]:
+        return next((link for link in self.remotes if not link.paired), None)
 
     def _pair_remote(self) -> None:
         code = self.pair_entry.get().strip()
         if len(code.replace("-", "").replace(" ", "")) < 8:
             self.remote_msg.configure(text="Type the 8-character code shown in Broto.", text_color=ERR)
             return
+        link = self._free_remote()
+        if link is None:
+            return
         self.pair_btn.configure(state="disabled", text="Connecting…")
         self.remote_msg.configure(text="Connecting to Broto…", text_color=MUTED)
         self._log("Remote signing: pairing this PC with Broto…")
-        self.remote.pair_async(code)
+        link.pair_async(code)
 
-    def _unpair_remote(self) -> None:
-        self.unpair_btn.configure(state="disabled")
+    def _unpair_remote(self, slot: int = 0) -> None:
+        self.unpair_btns[slot].configure(state="disabled")
         self.remote_msg.configure(text="Disconnecting…", text_color=MUTED)
-        self.remote.disconnect_async()
+        self.remotes[slot].disconnect_async()
 
     def _remote_report(self) -> dict:
-        """Built on the heartbeat thread from the UI-thread snapshot — never touches Tk."""
-        return device_report(dict(self._status_snapshot), APP_VERSION)
+        """Built on the heartbeat thread from the UI-thread snapshot — never touches Tk.
+        ``token_connected`` is asked from the driver right now (2.6.1): the snapshot
+        only knows that Connect once worked, and a token pulled out and plugged into
+        another PC must stop this PC being the one Broto asks to sign."""
+        snapshot = dict(self._status_snapshot)
+        present = self._tokens_present(snapshot.get("tokens") or [])
+        if present is not None:
+            snapshot["token_connected"] = present
+        return device_report(snapshot, APP_VERSION)
+
+    def _tokens_present(self, wanted: list) -> Optional[bool]:
+        """Heartbeat thread. True / False = a token the certificates were read from
+        is / isn't plugged in now; None = not checked — nothing was ever connected,
+        or a signature is running (the token is in, and a driver call beside a
+        signature is not worth the risk), or the driver would not answer. The
+        token lock is held for the few milliseconds of the probe so no signature
+        starts in the middle of it."""
+        if not wanted or self._signing_now() or not self._token_lock.acquire(blocking=False):
+            return None
+        try:
+            present = set()
+            answered = False
+            for module in sorted({m for m, _ in wanted if m}):
+                try:
+                    present |= present_token_keys(module)
+                    answered = True
+                except Exception:  # noqa: BLE001 - a driver that won't load or answer: not known
+                    continue
+            if not answered:
+                return None
+            return any(key in present for _, key in wanted)
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            self._token_lock.release()
 
     def _remote_session(self) -> "RemoteSignSession":
         """A run of remote jobs (remote.py, heartbeat thread): one token login for all of them."""
@@ -945,8 +1015,16 @@ class SignerApp:
         finally:
             session.close()
 
-    def _on_remote_event(self, event: str, payload) -> None:
+    def _for_firm(self, slot: Optional[int]) -> str:
+        """" for <firm>" in the Activity log once this PC serves two firms, else ""."""
+        if slot is None or sum(1 for link in self.remotes if link.paired) < 2:
+            return ""
+        return " for %s" % (self.remotes[slot].firm_name or "Broto")
+
+    def _on_remote_event(self, event: str, payload, slot: Optional[int] = None) -> None:
+        firm = self._for_firm(slot)
         if event == "paired":
+            self._adding_firm = False
             self.pair_btn.configure(state="normal", text="Connect")
             self.pair_entry.delete(0, "end")
             self.remote_msg.configure(text="", text_color=MUTED)
@@ -960,19 +1038,21 @@ class SignerApp:
             self._log("Remote signing: pairing failed — " + str(payload))
         elif event == "online":
             self.remote_msg.configure(text="", text_color=MUTED)
-            self._log("Remote signing: connected to Broto.")
+            self._log("Remote signing%s: connected to Broto." % firm)
         elif event == "offline":
             self.remote_msg.configure(text="Can't reach Broto right now — retrying. " + str(payload or ""),
                                       text_color=WARN)
-            self._log("Remote signing: can't reach Broto — " + str(payload))
+            self._log("Remote signing%s: can't reach Broto — %s" % (firm, payload))
         elif event == "revoked":
-            self.unpair_btn.configure(state="normal")
+            if slot is not None:
+                self.unpair_btns[slot].configure(state="normal")
             self.remote_msg.configure(text=str(payload or "This computer was removed from Broto."),
                                       text_color=WARN)
-            self._log("Remote signing OFF — " + str(payload))
+            self._log("Remote signing OFF%s — %s" % (firm, payload))
             self._flash("Remote signing was switched off from Broto", WARN)
         elif event == "disconnected":
-            self.unpair_btn.configure(state="normal")
+            if slot is not None:
+                self.unpair_btns[slot].configure(state="normal")
             self.remote_msg.configure(text="Disconnected. Pair again any time with a new code.", text_color=MUTED)
             self._log("Remote signing OFF — disconnected from Broto.")
         elif event == "job_signed":
@@ -988,8 +1068,8 @@ class SignerApp:
                 tail = "Broto stored it on the job for download and portal upload."
             else:
                 tail = "Broto is filing it."
-            self._log("✓ Signed %s for job %s remotely — asked by %s. %s%s"
-                      % (what, s.get("job_number"), who, tail, _timing_note(p.get("timings"))))
+            self._log("✓ Signed %s for job %s remotely%s — asked by %s. %s%s"
+                      % (what, s.get("job_number"), firm, who, tail, _timing_note(p.get("timings"))))
             self._flash("✓  Signed %s (job %s) remotely for %s" % (what, s.get("job_number"), who), OK)
             if self.root.state() == "iconic":
                 pass                                   # stay out of the way — the log has the details
@@ -997,14 +1077,14 @@ class SignerApp:
             p = payload if isinstance(payload, dict) else {}
             s, job = p.get("summary") or {}, p.get("job") or {}
             number = s.get("job_number") or job.get("job_seq")
-            self._log("Remote signing request%s failed (%s): %s"
-                      % ((" for job %s" % number) if number else "", p.get("code"), p.get("message")))
+            self._log("Remote signing request%s%s failed (%s): %s"
+                      % ((" for job %s" % number) if number else "", firm, p.get("code"), p.get("message")))
             self._flash("Couldn't sign a remote request — see Activity log", ERR)
         elif event == "run_done":
             p = payload if isinstance(payload, dict) else {}
             signed, failed = int(p.get("signed") or 0), int(p.get("failed") or 0)
-            self._log("Remote run done: %d file%s signed%s in %s s."
-                      % (signed, "" if signed == 1 else "s", (", %d failed" % failed) if failed else "",
+            self._log("Remote run done%s: %d file%s signed%s in %s s."
+                      % (firm, signed, "" if signed == 1 else "s", (", %d failed" % failed) if failed else "",
                          p.get("seconds")))
         elif event == "pin_rejected":
             token = payload if isinstance(payload, str) else ""
@@ -1213,21 +1293,24 @@ class SignerApp:
             self.bridge_pill.configure(text="  ⚡  One-click filing on  ", text_color=OK)
         else:
             self.bridge_pill.configure(text="  One-click filing off  ", text_color=ERR)
-        rs = self.remote.status()
-        if not rs["paired"]:
+        # One pill for every firm this PC is paired with: on only while all of them are.
+        paired = [st for st in (link.status() for link in self.remotes) if st["paired"]]
+        if not paired:
             self.remote_pill.configure(text="  Remote signing off  ", text_color=MUTED)
-        elif rs["online"]:
-            signed = int(rs.get("jobs_signed") or 0)
+        elif all(st["online"] for st in paired):
+            signed = sum(int(st.get("jobs_signed") or 0) for st in paired)
             self.remote_pill.configure(
                 text="  ☁  Remote signing on%s  " % ("  ·  %d signed" % signed if signed else ""),
                 text_color=OK)
-        elif rs["last_error"]:
+        elif any(st["last_error"] and not st["online"] for st in paired):
             self.remote_pill.configure(text="  ☁  Remote signing — can't reach Broto  ", text_color=WARN)
         else:
             self.remote_pill.configure(text="  ☁  Remote signing — connecting…  ", text_color=MUTED)
         self._status_snapshot = {
             "version": APP_VERSION,
             "token_connected": bool(self.certs),
+            # (driver, token key) of every certificate: what the heartbeat probes for (2.6.1).
+            "tokens": sorted({(c.module or self.module_var.get().strip(), c.token) for c in self.certs if c.token}),
             "certificate": (cert.common_name or cert.display) if cert else None,
             "pin_saved": bool(self._pins),
             # Per certificate: is the PIN of ITS token saved here (Broto refuses a remote
@@ -1314,7 +1397,7 @@ class SignerApp:
                 canvas.yview_moveto(max(0.0, min(1.0, (y - 12) / float(total))))
             except Exception:  # noqa: BLE001 - scrolling is a nicety
                 pass
-        if not self.remote.paired:
+        if not any(link.paired for link in self.remotes):
             self.pair_entry.focus_set()
 
     def _toggle_driver(self, open_: bool) -> None:
@@ -1599,7 +1682,7 @@ class SignerApp:
         elif kind == "bridge_err":
             self._bridge_err(*item[1:])
         elif kind == "remote":
-            self._on_remote_event(item[1], item[2])
+            self._on_remote_event(item[1], item[2], item[3] if len(item) > 3 else None)
         elif kind == "done":
             _, ok, fail, out_dir, pin = item
             self._busy = False
@@ -1765,7 +1848,7 @@ class SignerApp:
     def _shutdown_services(self) -> None:
         """Free the bridge port and stop background work before another copy starts."""
         self._quitting = True
-        for stop in (self.updater.stop, self.remote.stop, self.bridge.stop):
+        for stop in [self.updater.stop] + [link.stop for link in self.remotes] + [self.bridge.stop]:
             try:
                 stop()
             except Exception:  # noqa: BLE001

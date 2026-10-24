@@ -109,7 +109,7 @@ def _screen(files=1, pin="123456", busy=False, status_text="", **remote):
     app._pins = {}
     app.pin_entry = _Value(pin)
     app._busy = busy
-    app.remote = _Remote(**remote)
+    app.remotes = [_Remote(**remote)]
     app.module_var = _Value("SignatureP11.dll")
     app.settings = {}
     for name in ("count_lbl", "empty", "pill", "bridge_pill", "remote_pill", "sign_btn", "add_files_btn",
@@ -194,7 +194,7 @@ def _update_screen(busy=False, locked=False):
         app._token_lock.acquire()
     app._quitting = False
     app.updater = _Updater()
-    app.remote = types.SimpleNamespace(stop=lambda: None)
+    app.remotes = [types.SimpleNamespace(stop=lambda: None)]
     app.bridge = types.SimpleNamespace(stop=lambda: None)
     app.status_lbl = _Widget()
     app.root = types.SimpleNamespace(destroyed=False)
@@ -393,3 +393,155 @@ def test_the_activity_log_says_how_long_each_step_took():
     assert (signer_app._timing_note({"fetch_ms": 812, "sign_ms": 1100, "send_ms": 1949})
             == " (got it in 0.8 s · signed in 1.1 s · sent back in 1.9 s)")
     assert signer_app._timing_note({}) == "" and signer_app._timing_note(None) == ""
+
+
+# ------------------------------------------------------------ two firms on one PC (2.6)
+class _Shown(_Widget):
+    """A widget stand-in that knows whether it is on screen."""
+
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.shown = False
+
+    def grid(self, *args, **kwargs):
+        self.shown = True
+
+    def grid_forget(self):
+        self.shown = False
+
+
+class _Link:
+    def __init__(self, slot, firm=None, online=True, last_error=None, jobs_signed=0):
+        self.slot, self.firm_name, self.device_name = slot, firm, "OFFICE-PC"
+        self.paired = firm is not None
+        self._st = {"paired": self.paired, "online": self.paired and online, "last_error": last_error,
+                    "jobs_signed": jobs_signed, "firm_name": firm, "device_name": "OFFICE-PC"}
+
+    def status(self):
+        return dict(self._st)
+
+
+def _remote_box(*firms):
+    app = object.__new__(signer_app.SignerApp)
+    app.remotes = [_Link(slot, firm) for slot, firm in enumerate(firms)]
+    app._adding_firm = False
+    app.pair_entry, app.pair_btn, app.add_firm_btn = _Shown(), _Shown(), _Shown()
+    app.pair_entry.focus_set = lambda: None
+    app.remote_lbls = [_Shown() for _ in firms]
+    app.unpair_btns = [_Shown() for _ in firms]
+    app._layout_remote()
+    return app
+
+
+def test_a_pc_with_no_firm_shows_the_code_box_as_before():
+    app = _remote_box(None, None)
+    assert app.pair_entry.shown and app.pair_btn.shown and not app.add_firm_btn.shown
+    assert not any(w.shown for w in app.remote_lbls + app.unpair_btns)
+
+
+def test_a_pc_with_one_firm_shows_it_and_offers_another():
+    app = _remote_box("Firm A", None)
+    assert app.remote_lbls[0].shown and app.unpair_btns[0].shown
+    assert "Connected to Firm A as OFFICE-PC" in app.remote_lbls[0].cget("text")
+    assert not app.pair_entry.shown and app.add_firm_btn.shown
+    app._add_firm()
+    assert app.pair_entry.shown and app.pair_btn.shown and not app.add_firm_btn.shown
+    assert app._free_remote() is app.remotes[1]
+
+
+def test_a_pc_with_two_firms_shows_both_and_no_code_box():
+    app = _remote_box("Firm A", "Firm B")
+    assert all(w.shown for w in app.remote_lbls + app.unpair_btns)
+    assert not app.pair_entry.shown and not app.add_firm_btn.shown and app._free_remote() is None
+
+
+def test_firm_1_disconnected_keeps_firm_2_and_fills_slot_1_next():
+    app = _remote_box(None, "Firm B")
+    assert app.remote_lbls[1].shown and not app.remote_lbls[0].shown and app.add_firm_btn.shown
+    assert app._free_remote() is app.remotes[0]
+
+
+def _pill(*links):
+    app = _screen()
+    app.remotes = list(links)
+    app._refresh()
+    return app.remote_pill.cget("text")
+
+
+def test_the_pill_adds_up_both_firms():
+    assert "Remote signing on" in _pill(_Link(0, "A", jobs_signed=2), _Link(1, "B", jobs_signed=3))
+    assert "5 signed" in _pill(_Link(0, "A", jobs_signed=2), _Link(1, "B", jobs_signed=3))
+    assert "can't reach Broto" in _pill(_Link(0, "A"), _Link(1, "B", online=False, last_error="down"))
+    assert "connecting" in _pill(_Link(0, "A"), _Link(1, "B", online=False))
+    assert "Remote signing off" in _pill(_Link(0, None), _Link(1, None))
+
+
+def test_one_firm_pill_reads_exactly_as_before():
+    assert _pill(_Link(0, "A", jobs_signed=3), _Link(1, None)) == "  ☁  Remote signing on  ·  3 signed  "
+    assert _pill(_Link(0, "A"), _Link(1, None)) == "  ☁  Remote signing on  "
+
+
+def test_the_activity_log_names_the_firm_only_when_there_are_two():
+    app = _remote_box("Firm A", None)
+    assert app._for_firm(0) == "" and app._for_firm(None) == ""
+    app = _remote_box("Firm A", "Firm B")
+    assert app._for_firm(1) == " for Firm B"
+
+
+# ---------------------------------------------------------------------------
+# 2.6.1: "token plugged in" on every check-in comes from the driver, not from Connect
+# ---------------------------------------------------------------------------
+def _probe_app(monkeypatch, present, *, tokens=(("x.dll", "sn:A"),), busy=False, locked=False, broken=False):
+    import threading
+
+    app = object.__new__(signer_app.SignerApp)
+    app._busy = busy
+    app._approval = None
+    app._token_lock = threading.Lock()
+    if locked:
+        app._token_lock.acquire()
+    app._status_snapshot = {"token_connected": True, "pin_saved": True, "certificates": [], "tokens": list(tokens)}
+    calls = []
+
+    def fake_probe(module):
+        calls.append(module)
+        if broken:
+            raise RuntimeError("driver gone")
+        return set(present)
+
+    monkeypatch.setattr(signer_app, "present_token_keys", fake_probe)
+    return app, calls
+
+
+def test_check_in_says_the_token_is_out_once_it_is_pulled(monkeypatch):
+    app, calls = _probe_app(monkeypatch, present=set())
+    assert app._tokens_present(app._status_snapshot["tokens"]) is False
+    assert app._remote_report()["token_connected"] is False
+    assert calls == ["x.dll", "x.dll"]
+    assert not app._token_lock.locked()           # released after the probe
+
+
+def test_check_in_says_the_token_is_in_while_it_is(monkeypatch):
+    app, _ = _probe_app(monkeypatch, present={"sn:A", "sn:OTHER"})
+    assert app._remote_report()["token_connected"] is True
+
+
+def test_no_probe_while_a_signature_runs_or_before_connect(monkeypatch):
+    # The token lock is held by a signature: not probed, the snapshot's value stands.
+    app, calls = _probe_app(monkeypatch, present=set(), locked=True)
+    assert app._tokens_present(app._status_snapshot["tokens"]) is None
+    assert app._remote_report()["token_connected"] is True and calls == []
+    # Busy (a local batch) — same.
+    app, calls = _probe_app(monkeypatch, present=set(), busy=True)
+    assert app._remote_report()["token_connected"] is True and calls == []
+    # Nothing connected yet: nothing to look for.
+    app, calls = _probe_app(monkeypatch, present=set(), tokens=())
+    app._status_snapshot["token_connected"] = False
+    assert app._remote_report()["token_connected"] is False and calls == []
+
+
+def test_a_driver_that_will_not_answer_leaves_the_last_value(monkeypatch):
+    app, _ = _probe_app(monkeypatch, present=set(), broken=True)
+    assert app._tokens_present(app._status_snapshot["tokens"]) is None
+    assert app._remote_report()["token_connected"] is True
+    assert not app._token_lock.locked()

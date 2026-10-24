@@ -32,7 +32,7 @@ if stage == "done":
 if stage == "log":
     a._log("Token driver: C:\\Windows\\System32\\SignatureP11.dll")
     root.after(800, a._open_log)
-BE = {"headerField": {"senderID": "SUNWAYCHA", "receiverID": "INNSA1", "indicator": "P", "messageID": "CACHI01",
+BE = {"headerField": {"senderID": "TESTCHA01", "receiverID": "INNSA1", "indicator": "P", "messageID": "CACHI01",
                       "sequenceOrControlNumber": 1, "jobNumber": 4382026, "jobDate": "20260922", "messageType": "F"},
       "master": {"beModel": [{"iecCode": "0512345678", "nameOfImporter": "ACME IMPORTS PRIVATE LIMITED"}],
                  "invoiceModel": [{}, {}], "itemsModel": [{}] * 14}}

@@ -80,6 +80,10 @@ source, the app only logs that a new version is out. **Every release must bump
    `C:\Windows\System32\SignatureP11.dll`; if another known driver is
    installed instead it is picked up automatically, and **Settings** lets you
    pick any PKCS#11 DLL (e.g. `C:\Windows\System32\eps2003csp11v2.dll`).
+   ProxKey's own driver in its version folder —
+   `C:\Windows\System32\Watchdata\PROXKey CSP India V3.0\wdpkcs.dll` (V1.0 /
+   V2.0 on older installs) — is found too, right after the default: some PCs
+   with the WD ProxKey software have only that one (v2.6.2).
 3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
    name, the issuing CA and the expiry date (amber inside 30 days, red once
    expired).
@@ -146,6 +150,15 @@ Broto's **Settings ▸ DSC computers** list reads.
 3. **Disconnect** here, or **Remove** in Broto, ends it. A removed PC learns so
    on its next check-in and forgets its token.
 
+**Two firms on one PC (2.6.0).** A business that works as two Broto firms under
+one licence uses one PC and one DSC for both: with one firm connected, click
+**Add another firm** and type a code from the second firm's Broto. Each firm is
+its own pairing (Broto lists this PC once in each firm), with its own device
+token and check-in, and takes only its own firm's jobs; the token still signs
+one file at a time. Disconnecting one firm leaves the other connected. The
+first pairing keeps the settings keys a 2.5 Signer wrote, so updating a PC
+paired with one firm changes nothing for it.
+
 **Signing for someone else.** When a colleague clicks **Sign & file on ICEGATE**
 on a PC that has no Broto Signer, Broto emails a one-time code to the firm's
 ICEGATE OTP mailbox; once they type it, this PC picks the job up on its next
@@ -199,7 +212,10 @@ to download and upload on the ICEGATE portal.
 What the app stores: the device token Broto issued (Windows: DPAPI-encrypted
 like the PIN, same Windows login only), the firm + PC name, and which Broto
 server it paired with. What it sends on every check-in: the PC's hostname,
-app version, Windows version, token plugged in / PIN saved, and for each
+app version, Windows version, token plugged in / PIN saved (from 2.6.1 "plugged
+in" is asked from the driver at every check-in, so a token pulled out and put
+into another paired PC moves the signing there within one check-in; earlier
+versions only knew that Connect had once worked), and for each
 certificate on the token the holder, issuer, serial, expiry, a SHA-256
 thumbprint, whether it can sign, which token it is on (a short hash — never the
 token's serial number) and whether that token's PIN is saved — never the PIN
@@ -240,6 +256,10 @@ retried, because tokens lock after a few wrong PINs.
   application"*, Python's bitness doesn't match the driver's. `System32` holds
   the 64-bit DLL, `SysWOW64` the 32-bit one — point the module path at the one
   matching your Python, or install matching-bitness Python.
+- **A driver in a folder of its own** (ProxKey's `System32\Watchdata\PROXKey
+  CSP India V3.0\wdpkcs.dll`) may need the helper DLLs next to it, and
+  python-pkcs11 loads the driver with a plain `LoadLibraryW`, which never looks
+  in the driver's folder. `_open_lib` puts that folder on PATH first (v2.6.2).
 - **PDF/A:** eSANCHIT wants PDF/A specifically. This tool signs PDFs as-is; a
   convert-to-PDF/A step can be added if we wire it to eSANCHIT later.
 - **Not yet code-signed.** Windows SmartScreen may warn on an unsigned `.exe`;

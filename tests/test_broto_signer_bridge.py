@@ -24,14 +24,14 @@ import secure_store  # noqa: E402
 ORIGIN = "https://brotoai.com"
 
 BE = {
-    "headerField": {"senderID": "SUNWAYCHA", "receiverID": "INNSA1", "indicator": "T",
+    "headerField": {"senderID": "TESTCHA01", "receiverID": "INNSA1", "indicator": "T",
                     "messageID": "CACHI01", "sequenceOrControlNumber": 1,
                     "jobNumber": 4382026, "jobDate": "20260922", "messageType": "F"},
     "master": {"beModel": [{"iecCode": "0512345678", "nameOfImporter": "ACME IMPORTS PVT LTD"}],
                "invoiceModel": [{}, {}], "itemsModel": [{}, {}, {}]},
 }
 SB = {
-    "headerField": {"senderID": "SUNWAYCHA", "messageID": "CACHE01", "jobNumber": 9, "jobDate": "22092026"},
+    "headerField": {"senderID": "TESTCHA01", "messageID": "CACHE01", "jobNumber": 9, "jobDate": "22092026"},
     "master": {"sbModel": [{"importerExporterCode": "AAACA1234B", "impExpName": "ACME EXPORTS"}],
                "invoiceModel": [{}], "itemModel": [{}]},
 }
@@ -48,7 +48,7 @@ def test_describe_be_reads_everything_from_the_payload():
     assert s["party"] == "ACME IMPORTS PVT LTD" and s["iec"] == "0512345678"
     assert s["job_number"] == 4382026 and s["job_date"] == "20260922"
     assert s["invoices"] == 2 and s["items"] == 3
-    assert s["test_mode"] is True and s["sender_id"] == "SUNWAYCHA"
+    assert s["test_mode"] is True and s["sender_id"] == "TESTCHA01"
 
 
 def test_describe_sb():

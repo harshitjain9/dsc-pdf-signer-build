@@ -324,7 +324,7 @@ def test_thread_beats_on_demand():
 import base64  # noqa: E402
 
 BE_JOB_DOC = {
-    "headerField": {"senderID": "SUNWAYCHA", "receiverID": "INNSA1", "indicator": "P", "messageID": "CACHI01",
+    "headerField": {"senderID": "TESTCHA01", "receiverID": "INNSA1", "indicator": "P", "messageID": "CACHI01",
                     "sequenceOrControlNumber": 1, "jobNumber": 386, "jobDate": "20260924", "messageType": "F"},
     "master": {"beModel": [{"iecCode": "0512345678", "nameOfImporter": "ACME IMPORTS PVT LTD"}],
                "invoiceModel": [{}], "itemsModel": [{}, {}]},
@@ -840,3 +840,76 @@ def test_a_pin_saved_before_the_update_is_filed_under_its_token(fake_dpapi):
     assert secure_store.bind_legacy_pin("sn:A") is True
     assert secure_store.load_pins() == {"sn:A": "1111"} and secure_store.load_pin() is None
     assert secure_store.bind_legacy_pin("sn:B") is False                 # nothing left to file
+
+
+# ------------------------------------------------------------ two firms on one PC (2.6)
+def _slot_link(script, events, slot):
+    cls = _fake_client_cls(script)
+    link = remote.RemoteLink(report_fn=lambda: remote.device_report(SNAPSHOT, "2.6.0"),
+                             notify=lambda ev, p: events.append((ev, p)), client_cls=cls, slot=slot)
+    return link, cls
+
+
+def test_a_pc_paired_before_two_firm_pairing_keeps_its_pairing_in_slot_0():
+    """Settings written by 2.5 (one firm, the original keys) load as firm 1 unchanged."""
+    secure_store.save_settings({"remote_token_plain": "old-tok", "remote_device_id": "d1",
+                                "remote_firm_name": "Firm A", "remote_device_name": "OFFICE-PC",
+                                "remote_api_base": "https://api.brotoai.com"})
+    first, _ = _slot_link({}, [], 0)
+    second, _ = _slot_link({}, [], 1)
+    assert first.paired and first.token == "old-tok" and first.device_id == "d1"
+    assert first.firm_name == "Firm A" and first.device_name == "OFFICE-PC"
+    assert not second.paired and second.firm_name is None
+
+
+def test_pairing_a_second_firm_never_touches_the_first():
+    events = []
+    _paired_link({}, events)                                  # firm 1 in the original keys
+    second, cls = _slot_link({"pair": [{"ok": True, "device_token": "tok-2", "device_id": "d2",
+                                        "firm_name": "Firm B", "device_name": "OFFICE-PC"}]}, events, 1)
+    second.pair("ABCD-EFGH")
+    st = secure_store.load_settings()
+    assert st["remote_token_plain"] == "tok-1" and st["remote_device_id"] == "d1"
+    assert st["remote_firm_name"] == "Firm A"
+    assert st["remote_token_plain_2"] == "tok-2" and st["remote_device_id_2"] == "d2"
+    assert st["remote_firm_name_2"] == "Firm B"
+    assert secure_store.load_remote_token(0) == "tok-1" and secure_store.load_remote_token(1) == "tok-2"
+    assert events[-1][0] == "paired" and events[-1][1]["slot"] == 1
+    # A fresh start reads both firms back.
+    first, _ = _slot_link({}, [], 0)
+    again, _ = _slot_link({}, [], 1)
+    assert first.firm_name == "Firm A" and again.firm_name == "Firm B" and again.device_id == "d2"
+
+
+def test_each_firm_beats_with_its_own_token():
+    _paired_link({}, [])
+    secure_store.save_remote_token("tok-2", 1)
+    first, cls1 = _slot_link({"heartbeat": [{"ok": True}]}, [], 0)
+    second, cls2 = _slot_link({"heartbeat": [{"ok": True}]}, [], 1)
+    first._beat()
+    second._beat()
+    assert [c[2] for c in cls1.calls] == ["tok-1"] and [c[2] for c in cls2.calls] == ["tok-2"]
+
+
+def test_removing_one_firm_keeps_the_other():
+    events = []
+    _paired_link({}, events)
+    secure_store.save_remote_token("tok-2", 1)
+    secure_store.update_settings(remote_device_id_2="d2", remote_firm_name_2="Firm B")
+    second, _ = _slot_link({"heartbeat": [remote.RemoteError("revoked", "Removed.", 401)]}, events, 1)
+    second._beat()                                            # firm B removed this PC in Broto
+    assert not second.paired and secure_store.load_remote_token(1) is None
+    st = secure_store.load_settings()
+    assert "remote_device_id_2" not in st and "remote_firm_name_2" not in st
+    assert secure_store.load_remote_token(0) == "tok-1" and st["remote_firm_name"] == "Firm A"
+    first, cls = _slot_link({"unpair": [{"ok": True}]}, events, 0)
+    secure_store.save_remote_token("tok-2", 1)
+    first.disconnect()                                        # Disconnect on firm A
+    assert secure_store.load_remote_token(0) is None and secure_store.load_remote_token(1) == "tok-2"
+    assert cls.calls[0][2] == "tok-1"
+
+
+def test_an_empty_second_slot_never_calls_broto():
+    second, cls = _slot_link({}, [], 1)
+    second._beat()
+    assert cls.calls == [] and not second.paired

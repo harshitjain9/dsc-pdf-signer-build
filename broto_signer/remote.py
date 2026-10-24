@@ -27,6 +27,12 @@ the current one, and signed files go back to Broto. The token itself signs
 one file at a time and is logged in once for the run (a token chip does one
 signature at a time, and every extra login is another chance to lock it).
 
+Two firms on one PC (2.6): a firm that works as two Broto accounts under one
+licence pairs the same PC — and the same DSC — with both. Each pairing is its
+own RemoteLink (``slot`` 0 or 1), with its own device token, heartbeat thread
+and jobs; Broto keeps them apart as two devices. Slot 0 is the original
+pairing, so a PC paired with one firm works exactly as before.
+
 Standard library only (urllib honours the system proxy). No UI here: the app
 supplies ``report_fn`` (a snapshot of its state, safe to read off-thread) and
 ``notify(event, payload)`` (called from worker threads — route it through the
@@ -61,6 +67,8 @@ MAX_JOBS_PER_DRAIN = 10         # signing jobs taken in one go before the next h
 FETCH_LANES = 2                 # files downloading from Broto at the same time while the token signs
 POST_LANES = 2                  # signed files going back to Broto at the same time (each holds a Broto DB slot)
 READ_AHEAD = 2                  # downloaded files waiting for the token, at most
+MAX_FIRMS = 2                   # firms one PC can be paired with at once (one RemoteLink each)
+_settings_lock = threading.Lock()   # the links share settings.json: one read-modify-write at a time
 
 # Events handed to ``notify`` (payload in brackets):
 #   paired (status dict) · pair_failed (message) · online (status dict) ·
@@ -313,7 +321,8 @@ class RemoteLink:
                  sign_fn: Optional[Callable[[bytes, Dict[str, Any]], bytes]] = None,
                  session_fn: Optional[Callable[[], Any]] = None,
                  client_cls: Callable[..., Any] = RemoteClient,
-                 interval_s: float = HEARTBEAT_INTERVAL_S) -> None:
+                 interval_s: float = HEARTBEAT_INTERVAL_S, slot: int = 0) -> None:
+        self.slot = int(slot)
         self.report_fn = report_fn
         self.notify = notify
         # sign_fn(content, summary) -> signed bytes, or raise SignError. Runs on
@@ -329,11 +338,11 @@ class RemoteLink:
         self._client_cls = client_cls
         self.interval_s = float(interval_s)
         self.api_base = default_api_base()
-        self.token: Optional[str] = store.load_remote_token()
+        self.token: Optional[str] = store.load_remote_token(self.slot)
         s = store.load_settings()
-        self.device_id: Optional[str] = s.get("remote_device_id") or None
-        self.firm_name: Optional[str] = s.get("remote_firm_name") or None
-        self.device_name: Optional[str] = s.get("remote_device_name") or None
+        self.device_id: Optional[str] = s.get(self._key("remote_device_id")) or None
+        self.firm_name: Optional[str] = s.get(self._key("remote_firm_name")) or None
+        self.device_name: Optional[str] = s.get(self._key("remote_device_name")) or None
         self.last_ok: Optional[float] = None
         self.last_error: Optional[str] = None
         self._failures = 0
@@ -341,6 +350,9 @@ class RemoteLink:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _key(self, name: str) -> str:
+        return store.remote_key(name, self.slot)
 
     # ----------------------------------------------------------- state
     @property
@@ -362,13 +374,15 @@ class RemoteLink:
             "last_ok": self.last_ok,
             "last_error": self.last_error,
             "jobs_signed": self.jobs_signed,
+            "slot": self.slot,
         }
 
     # ----------------------------------------------------------- thread
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._loop, name="broto-remote", daemon=True)
+        name = "broto-remote" if not self.slot else "broto-remote-%d" % (self.slot + 1)
+        self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -618,12 +632,12 @@ class RemoteLink:
         token = out.get("device_token")
         if not isinstance(token, str) or not token:
             raise RemoteError("bad_response", "Broto didn't return a device token — try again.")
-        with self._lock:
-            store.save_remote_token(token)
-            store.update_settings(remote_api_base=base,
-                                  remote_device_id=out.get("device_id") or None,
-                                  remote_firm_name=out.get("firm_name") or None,
-                                  remote_device_name=out.get("device_name") or None)
+        with self._lock, _settings_lock:
+            store.save_remote_token(token, self.slot)
+            store.update_settings(remote_api_base=base, **{
+                self._key("remote_device_id"): out.get("device_id") or None,
+                self._key("remote_firm_name"): out.get("firm_name") or None,
+                self._key("remote_device_name"): out.get("device_name") or None})
             self.api_base = base
             self.token = token
             self.device_id = out.get("device_id") or None
@@ -662,9 +676,10 @@ class RemoteLink:
         threading.Thread(target=self.disconnect, name="broto-remote-unpair", daemon=True).start()
 
     def _forget(self) -> None:
-        with self._lock:
-            store.forget_remote_token()
-            store.update_settings(remote_device_id=None, remote_firm_name=None, remote_device_name=None)
+        with self._lock, _settings_lock:
+            store.forget_remote_token(self.slot)
+            store.update_settings(**{self._key("remote_device_id"): None, self._key("remote_firm_name"): None,
+                                     self._key("remote_device_name"): None})
             self.token = None
             self.device_id = None
             self.firm_name = None

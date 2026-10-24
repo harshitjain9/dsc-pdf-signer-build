@@ -16,11 +16,12 @@ cross-platform. Everything runs locally; nothing leaves the machine.
 """
 from __future__ import annotations
 
+import glob
 import os
 import platform
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 # The <SIGNER-VERSION> value stamped into signed flat files. ICEGATE appears to
 # treat this as an audit/log tag (it is NOT part of the signed hash) — confirm on
@@ -49,6 +50,12 @@ _WINDOWS_MODULES = [
     r"C:\Windows\System32\AKChiptokenInterface_3003.dll",
     r"C:\Windows\System32\opensc-pkcs11.dll",        # OpenSC (generic fallback)
 ]
+# The ProxKey software also keeps Watchdata's own driver in a folder named after
+# its version: System32\Watchdata\PROXKey CSP India V3.0\wdpkcs.dll (V1.0 / V2.0
+# on older installs). A PC can have that one and no SignatureP11.dll (2026-10-24:
+# the WD ProxKey tool showed the certificate, the Signer found no driver), so it
+# is looked for right after the default, newest version first.
+_WATCHDATA_MODULES = r"C:\Windows\System32\Watchdata\*\wdpkcs.dll"
 _MAC_MODULES = [
     "/Library/OpenSC/lib/opensc-pkcs11.so",
     "/usr/local/lib/opensc-pkcs11.so",
@@ -62,7 +69,11 @@ _LINUX_MODULES = [
 
 
 def _candidate_modules() -> List[str]:
-    return {"Windows": _WINDOWS_MODULES, "Darwin": _MAC_MODULES}.get(platform.system(), _LINUX_MODULES)
+    system = platform.system()
+    if system == "Windows":
+        watchdata = sorted(glob.glob(_WATCHDATA_MODULES), reverse=True)
+        return _WINDOWS_MODULES[:1] + watchdata + _WINDOWS_MODULES[1:]
+    return {"Darwin": _MAC_MODULES}.get(system, _LINUX_MODULES)
 
 
 def discover_modules() -> List[str]:
@@ -142,6 +153,37 @@ def token_ref(key: str) -> str:
     """What Broto is told about a token: a short hash of its key."""
     import hashlib
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else ""
+
+
+def _open_lib(module: str):
+    """``pkcs11.lib(module)``, with the driver's own folder put on PATH first.
+
+    python-pkcs11 loads the driver with a plain LoadLibraryW, and Windows then
+    looks for the DLLs that driver needs in System32 and on PATH — never in the
+    driver's own folder. A driver that needs helper DLLs kept next to it (the
+    Watchdata ProxKey folder holds several) would otherwise not load."""
+    import pkcs11
+
+    folder = os.path.dirname(module)
+    if platform.system() == "Windows" and folder:
+        path = os.environ.get("PATH", "")
+        if os.path.normcase(folder) not in (os.path.normcase(p) for p in path.split(os.pathsep)):
+            os.environ["PATH"] = folder + os.pathsep + path
+    return pkcs11.lib(module)
+
+
+def present_token_keys(module: str) -> Set[str]:
+    """The ``token_key`` of every token plugged in right now that ``module`` can
+    see. Only the slot list and each token's info are read — no session, no PIN —
+    so it is cheap enough for every check-in with Broto. The keys match the ones
+    ``list_certificates`` stamps on certificates (same enumeration)."""
+    out: Set[str] = set()
+    for slot_index, slot in enumerate(_open_lib(module).get_slots(token_present=True)):
+        try:
+            out.add(token_key(slot.get_token(), slot_index))
+        except Exception:  # noqa: BLE001 - a slot that lost its token between the two calls
+            continue
+    return out
 
 
 def _describe_cert(der: bytes) -> dict:
@@ -235,9 +277,7 @@ def list_certificates(module: str, pin: Optional[str] = None,
     none it could read, that way: with that token's OWN saved PIN (``pins``, by
     token_key), else with ``pin`` (the PIN just typed). Never another token's
     saved PIN."""
-    import pkcs11
-
-    lib = pkcs11.lib(module)
+    lib = _open_lib(module)
     out: List[CertInfo] = []
     seen = set()
     for slot_index, slot in enumerate(lib.get_slots(token_present=True)):
@@ -352,10 +392,9 @@ class DscSigner:
 
     def __init__(self, module: str, pin: str, cert_id: bytes = b"", cert_label: str = "",
                  slot_index: int = 0):
-        import pkcs11
         from pkcs11 import Attribute, ObjectClass
         from pyhanko.sign.pkcs11 import PKCS11Signer
-        slots = pkcs11.lib(module).get_slots(token_present=True)
+        slots = _open_lib(module).get_slots(token_present=True)
         if not slots:
             raise RuntimeError("No token present — plug in the DSC and try again.")
         # Multi-slot readers (ProxKey / SignatureP11, etc.) expose several slots,
