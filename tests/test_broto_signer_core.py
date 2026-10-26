@@ -56,6 +56,7 @@ def test_a_driver_in_its_own_folder_loads_with_that_folder_on_path(monkeypatch):
     driver = os.path.join(folder, "wdpkcs.dll")
     assert core._open_lib(driver) == "lib"
     assert core._open_lib(driver) == "lib"
+    folder, driver = os.path.normcase(folder), os.path.normcase(driver)  # Windows loads it lower-cased (2.6.3)
     assert seen == [(driver, folder + os.pathsep + "system32")] * 2     # added once, not twice
     assert core._open_lib("SignatureP11.dll") == "lib"                   # no folder: PATH unchanged
     assert os.environ["PATH"] == folder + os.pathsep + "system32"
