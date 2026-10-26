@@ -68,7 +68,10 @@ APP_TITLE = "Broto DSC Signer"
 #         puts a driver's own folder on PATH before loading it, so the helper DLLs next to it are found.
 # 2.6.3 = a driver picked with Browse (C:/Windows/...) no longer breaks every token read after it with
 #         "Initialisation error (already initialized)": the same DLL is loaded once, whatever the slashes.
-APP_VERSION = "2.6.3"
+# 2.6.4 = finds the mToken CryptoID driver, System32\CryptoIDA_pkcs11.dll — an mToken PC used to show
+#         "No certificates found" until someone browsed to it — and signs .be / .sb / JSON on a token
+#         without the SHA-1 signing method (the mToken signed PDFs, every .be said "MechanismInvalid()").
+APP_VERSION = "2.6.4"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette

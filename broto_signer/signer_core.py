@@ -35,18 +35,22 @@ SIGNER_VERSION = b"V-BROTO_09.2026"
 JSON_SIGNER_VERSION = b"1.0"
 
 
-# The default token driver (ProxKey / mToken SignatureP11) — what the app
+# The default token driver (WD ProxKey's SignatureP11) — what the app
 # offers when nothing was saved and auto-detect finds nothing.
 DEFAULT_WINDOWS_MODULE = r"C:\Windows\System32\SignatureP11.dll"
 
 # Common PKCS#11 module paths for the DSC tokens Indian CHAs use.
 _WINDOWS_MODULES = [
-    DEFAULT_WINDOWS_MODULE,                           # ProxKey / mToken — the default
+    DEFAULT_WINDOWS_MODULE,                           # WD ProxKey — the default
+    # mToken CryptoID (Longmai). Its utility lists this 64-bit driver and a 32-bit copy in
+    # SysWOW64, which the 64-bit Signer cannot load (v2.6.4; before, an mToken PC found no
+    # driver and showed "No certificates found").
+    r"C:\Windows\System32\CryptoIDA_pkcs11.dll",
     r"C:\Windows\System32\eps2003csp11v2.dll",       # ePass2003 (Watchdata)
     r"C:\Windows\System32\eps2003csp11.dll",
     r"C:\Windows\System32\wdpkcs.dll",               # Watchdata ProxKey
     r"C:\Windows\System32\eTPKCS11.dll",             # SafeNet / Aladdin eToken
-    r"C:\Windows\System32\ShuttleCsp11_3003.dll",    # TrustKey / mToken CryptoID
+    r"C:\Windows\System32\ShuttleCsp11_3003.dll",    # TrustKey
     r"C:\Windows\System32\AKChiptokenInterface_3003.dll",
     r"C:\Windows\System32\opensc-pkcs11.dll",        # OpenSC (generic fallback)
 ]
@@ -394,9 +398,15 @@ def open_pdf_for_signing(content: bytes):
     return IncrementalPdfFileWriter(io.BytesIO(content), strict=False)
 
 
+# The PKCS#1 v1.5 DigestInfo header for a SHA-1 digest (RFC 8017 §9.2, note 1).
+_SHA1_DIGEST_INFO = bytes.fromhex("3021300906052b0e03021a05000414")
+
+
 class DscSigner:
     """Opens ONE PKCS#11 session (one PIN entry) and signs many files with one
     chosen certificate. Call close() when done."""
+
+    _raw_rsa = False   # True once the token refused CKM_SHA1_RSA_PKCS (see _double_hash_sign)
 
     def __init__(self, module: str, pin: str, cert_id: bytes = b"", cert_label: str = "",
                  slot_index: int = 0):
@@ -490,11 +500,27 @@ class DscSigner:
         Reproduced on the token by feeding the 32-byte SHA-256 digest to
         CKM_SHA1_RSA_PKCS (the token then SHA-1s that digest and signs the
         DigestInfo). Confirmed on real signed BE/SB flat files AND JSON payloads from
-        two other CHA tools (Pantasign and Capricorn DSCs) — same math for both."""
+        two other CHA tools (Pantasign and Capricorn DSCs) — same math for both.
+
+        A token without CKM_SHA1_RSA_PKCS (the FIPS 140-3 mToken CryptoID answers
+        MechanismInvalid: PDFs signed, every .be failed, 2026-10-26) gets the SHA-1
+        done here and signs the DigestInfo with plain CKM_RSA_PKCS. PKCS#1 v1.5 is
+        deterministic, so the signature is byte-for-byte the same. The token is
+        asked only once per session."""
         import hashlib
-        from pkcs11 import Mechanism
+        from pkcs11 import Mechanism, MechanismInvalid
         inner = hashlib.sha256(core).digest()
-        return self._private_key().sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
+        key = self._private_key()
+        if not self._raw_rsa:
+            try:
+                return key.sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
+            except MechanismInvalid:
+                self._raw_rsa = True
+        try:
+            return key.sign(_SHA1_DIGEST_INFO + hashlib.sha1(inner).digest(), mechanism=Mechanism.RSA_PKCS)
+        except MechanismInvalid:
+            raise RuntimeError("This DSC token cannot sign .be, .sb or JSON files. "
+                               "Use another DSC token for these files.") from None
 
     def sign_flatfile(self, in_path: str, out_path: str) -> None:
         """File wrapper around :meth:`sign_flatfile_bytes`."""

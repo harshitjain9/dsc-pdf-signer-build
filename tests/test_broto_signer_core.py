@@ -42,6 +42,20 @@ def test_proxkey_driver_in_its_watchdata_folder_is_found_after_the_default(monke
     assert core.discover_modules() == [core.DEFAULT_WINDOWS_MODULE, v3, epass]   # SignatureP11 stays first
 
 
+def test_mtoken_cryptoid_driver_is_found_on_its_own_and_next_to_proxkey(monkeypatch):
+    """A PC with an mToken plugged in (2026-10-26): the Signer knew only ProxKey's driver and
+    showed "No certificates found". The mToken's own driver in System32 is now found — on its
+    own it is the default, and next to SignatureP11.dll it is read too on every Connect."""
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    mtoken = r"C:\Windows\System32\CryptoIDA_pkcs11.dll"
+    monkeypatch.setattr(core.glob, "glob", lambda pattern: [])
+    monkeypatch.setattr(core.os.path, "exists", lambda p: p == mtoken)
+    assert core.discover_modules() == [mtoken]
+    assert core.default_module() == mtoken
+    monkeypatch.setattr(core.os.path, "exists", lambda p: p in (core.DEFAULT_WINDOWS_MODULE, mtoken))
+    assert core.discover_modules() == [core.DEFAULT_WINDOWS_MODULE, mtoken]   # SignatureP11 stays first
+
+
 def test_a_driver_in_its_own_folder_loads_with_that_folder_on_path(monkeypatch):
     """python-pkcs11 loads a driver with a plain LoadLibraryW, which never looks in the driver's
     own folder for the DLLs it needs — so that folder goes on PATH first, once."""
@@ -372,6 +386,82 @@ def test_sign_pdf_bytes_reads_pdfs_non_strict(monkeypatch):
     signer._signer = _test_signer()
     original = _pdf_with_freed_object_in_update()
     assert signer.sign_pdf_bytes(original).startswith(original)
+
+
+# ------------------------------------------------------------ flat-file signature
+def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True):
+    """A stand-in for the token's private key (real RSA maths) plus a stub pkcs11
+    module. ``sha1_rsa`` / ``rsa_pkcs`` say which mechanisms the token offers."""
+    import types
+
+    import pytest
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    class MechanismInvalid(Exception):
+        pass
+
+    mod = types.ModuleType("pkcs11")
+    mod.Mechanism = types.SimpleNamespace(SHA1_RSA_PKCS="SHA1_RSA_PKCS", RSA_PKCS="RSA_PKCS")
+    mod.MechanismInvalid = MechanismInvalid
+    monkeypatch.setitem(sys.modules, "pkcs11", mod)
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    n, d, k = priv.public_key().public_numbers().n, priv.private_numbers().d, 256
+
+    class Key:
+        def __init__(self):
+            self.used = []
+
+        def sign(self, data, mechanism):
+            self.used.append(mechanism)
+            if mechanism == "SHA1_RSA_PKCS" and sha1_rsa:
+                return priv.sign(data, padding.PKCS1v15(), hashes.SHA1())
+            if mechanism == "RSA_PKCS" and rsa_pkcs:     # pad as PKCS#1 v1.5 type 1, raw RSA
+                em = b"\x00\x01" + b"\xff" * (k - 3 - len(data)) + b"\x00" + data
+                return pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
+            raise MechanismInvalid()
+
+    key = Key()
+    signer = core.DscSigner.__new__(core.DscSigner)
+    signer._private_key = lambda: key
+    signer._certificate_der = lambda: b"CERT"
+    return signer, key, priv
+
+
+def _signature_of(signed: bytes) -> bytes:
+    import base64
+    return base64.b64decode(signed.split(b"<START-SIGNATURE>")[1].split(b"</START-SIGNATURE>")[0])
+
+
+def test_a_token_without_sha1_rsa_signs_flat_files_with_plain_rsa_and_the_same_bytes(monkeypatch):
+    """A customer PC, 2026-10-26: an mToken CryptoID (FIPS 140-3) signed PDFs but every .be
+    failed with "MechanismInvalid()" — its driver has no CKM_SHA1_RSA_PKCS. The Signer does
+    the SHA-1 itself and signs with plain CKM_RSA_PKCS: byte-for-byte the signature
+    CKM_SHA1_RSA_PKCS gives, and the token is asked for SHA-1 only once per session."""
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    signer, key, priv = _token_key(monkeypatch, sha1_rsa=False)
+    content = b"HREC\x1dZZ\x1dTESTCHA01\r\n"
+    inner = hashlib.sha256(content.rstrip(b"\r\n")).digest()
+    assert _signature_of(signer.sign_flatfile_bytes(content)) == priv.sign(inner, padding.PKCS1v15(), hashes.SHA1())
+    signer.sign_flatfile_bytes(content)
+    assert key.used == ["SHA1_RSA_PKCS", "RSA_PKCS", "RSA_PKCS"]
+
+
+def test_a_token_with_sha1_rsa_still_signs_the_old_way(monkeypatch):
+    signer, key, _ = _token_key(monkeypatch, sha1_rsa=True)
+    signer.sign_flatfile_bytes(b"HREC\r\n")
+    assert key.used == ["SHA1_RSA_PKCS"]
+
+
+def test_a_token_with_neither_method_says_so_in_plain_words(monkeypatch):
+    import pytest
+    signer, _, _ = _token_key(monkeypatch, sha1_rsa=False, rsa_pkcs=False)
+    with pytest.raises(RuntimeError, match="cannot sign .be, .sb or JSON files"):
+        signer.sign_flatfile_bytes(b"HREC\r\n")
 
 
 # ------------------------------------------------------------ one PIN per token

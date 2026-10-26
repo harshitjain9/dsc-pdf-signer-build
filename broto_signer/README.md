@@ -83,7 +83,10 @@ source, the app only logs that a new version is out. **Every release must bump
    ProxKey's own driver in its version folder —
    `C:\Windows\System32\Watchdata\PROXKey CSP India V3.0\wdpkcs.dll` (V1.0 /
    V2.0 on older installs) — is found too, right after the default: some PCs
-   with the WD ProxKey software have only that one (v2.6.2).
+   with the WD ProxKey software have only that one (v2.6.2). The **mToken
+   CryptoID** driver, `C:\Windows\System32\CryptoIDA_pkcs11.dll`, is found
+   too (v2.6.4). Its utility also lists a copy in `SysWOW64`: that one is
+   32-bit and the Signer cannot load it.
 3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
    name, the issuing CA and the expiry date (amber inside 30 days, red once
    expired).
@@ -260,6 +263,10 @@ retried, because tokens lock after a few wrong PINs.
   CSP India V3.0\wdpkcs.dll`) may need the helper DLLs next to it, and
   python-pkcs11 loads the driver with a plain `LoadLibraryW`, which never looks
   in the driver's folder. `_open_lib` puts that folder on PATH first (v2.6.2).
+- **"MechanismInvalid()" on a .be / .sb / JSON file while PDFs sign fine** — the
+  token's driver has no SHA-1 signing method (`CKM_SHA1_RSA_PKCS`; the FIPS
+  140-3 mToken CryptoID). The Signer then does the SHA-1 itself and signs with
+  plain `CKM_RSA_PKCS`, which gives the same signature bytes (v2.6.4).
 - **"Initialisation error (already initialized). Should never see this."** —
   python-pkcs11 keeps one loaded driver per path *text*, so the same DLL named
   with `\` and with `/` was loaded twice and the second start-up call failed.
