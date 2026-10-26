@@ -66,7 +66,9 @@ APP_TITLE = "Broto DSC Signer"
 # 2.6.2 = finds ProxKey's own driver, System32\Watchdata\<version folder>\wdpkcs.dll, on a PC without
 #         SignatureP11.dll (the WD ProxKey tool showed the certificate, the Signer found no driver), and
 #         puts a driver's own folder on PATH before loading it, so the helper DLLs next to it are found.
-APP_VERSION = "2.6.2"
+# 2.6.3 = a driver picked with Browse (C:/Windows/...) no longer breaks every token read after it with
+#         "Initialisation error (already initialized)": the same DLL is loaded once, whatever the slashes.
+APP_VERSION = "2.6.3"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -1422,7 +1424,7 @@ class SignerApp:
         p = filedialog.askopenfilename(title="Token PKCS#11 driver",
                                        filetypes=[("Driver", "*.dll *.so *.dylib"), ("All files", "*.*")])
         if p:
-            self.module_var.set(p)
+            self.module_var.set(os.path.normpath(p))   # Browse gives C:/...; one spelling everywhere
 
     def _connect(self) -> None:
         if self._busy:

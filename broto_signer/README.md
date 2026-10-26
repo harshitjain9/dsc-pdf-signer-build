@@ -260,6 +260,10 @@ retried, because tokens lock after a few wrong PINs.
   CSP India V3.0\wdpkcs.dll`) may need the helper DLLs next to it, and
   python-pkcs11 loads the driver with a plain `LoadLibraryW`, which never looks
   in the driver's folder. `_open_lib` puts that folder on PATH first (v2.6.2).
+- **"Initialisation error (already initialized). Should never see this."** —
+  python-pkcs11 keeps one loaded driver per path *text*, so the same DLL named
+  with `\` and with `/` was loaded twice and the second start-up call failed.
+  `_open_lib` now writes every path one way before loading it (v2.6.3).
 - **PDF/A:** eSANCHIT wants PDF/A specifically. This tool signs PDFs as-is; a
   convert-to-PDF/A step can be added if we wire it to eSANCHIT later.
 - **Not yet code-signed.** Windows SmartScreen may warn on an unsigned `.exe`;

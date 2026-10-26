@@ -161,9 +161,17 @@ def _open_lib(module: str):
     python-pkcs11 loads the driver with a plain LoadLibraryW, and Windows then
     looks for the DLLs that driver needs in System32 and on PATH — never in the
     driver's own folder. A driver that needs helper DLLs kept next to it (the
-    Watchdata ProxKey folder holds several) would otherwise not load."""
+    Watchdata ProxKey folder holds several) would otherwise not load.
+
+    The path is first written one way only (``normcase(normpath(...))``):
+    python-pkcs11 keeps one loaded driver per path TEXT, so the same DLL named
+    ``C:\\Windows\\...`` and ``C:/Windows/...`` (Browse writes forward slashes)
+    was loaded twice, and the second C_Initialize failed with "Initialisation
+    error (already initialized)" — every token read after that failed (a customer PC,
+    2026-10-26)."""
     import pkcs11
 
+    module = os.path.normcase(os.path.normpath(module)) if module else module
     folder = os.path.dirname(module)
     if platform.system() == "Windows" and folder:
         path = os.environ.get("PATH", "")

@@ -61,6 +61,25 @@ def test_a_driver_in_its_own_folder_loads_with_that_folder_on_path(monkeypatch):
     assert os.environ["PATH"] == folder + os.pathsep + "system32"
 
 
+def test_one_driver_written_with_either_slash_is_loaded_once(monkeypatch):
+    """A customer PC, 2026-10-26: the driver was loaded as C:\\Windows\\System32\\SignatureP11.dll at start,
+    then Browse set C:/Windows/System32/SignatureP11.dll. python-pkcs11 keeps one driver per path
+    text, so the DLL was started twice and every read after failed "already initialized"."""
+    import ntpath
+    import types
+    seen = []
+    mod = types.ModuleType("pkcs11")
+    mod.lib = lambda so: seen.append(so) or "lib"
+    monkeypatch.setitem(sys.modules, "pkcs11", mod)
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(core.os, "path", ntpath)
+    monkeypatch.setenv("PATH", "")
+    for spelling in (r"C:\Windows\System32\SignatureP11.dll", "C:/Windows/System32/SignatureP11.dll",
+                     r"c:\windows\system32\SIGNATUREP11.DLL"):
+        assert core._open_lib(spelling) == "lib"
+    assert len(set(seen)) == 1
+
+
 # ------------------------------------------------------------ several tokens
 def _cert(name, thumb, module="", can_sign=True, serial="", not_after=None, slot=0):
     return CertInfo(label="", subject="CN=" + name, common_name=name, thumbprint=thumb, module=module,
