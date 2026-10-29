@@ -71,7 +71,13 @@ APP_TITLE = "Broto DSC Signer"
 # 2.6.4 = finds the mToken CryptoID driver, System32\CryptoIDA_pkcs11.dll — an mToken PC used to show
 #         "No certificates found" until someone browsed to it — and signs .be / .sb / JSON on a token
 #         without the SHA-1 signing method (the mToken signed PDFs, every .be said "MechanismInvalid()").
-APP_VERSION = "2.6.4"
+# 2.6.5 = finds the HyperPKI HYP2003 driver (System32\HyperPKICsp11_2003.dll) and the Precision InnaIT
+#         driver (System32\InnaITPKCS11Driver.dll), the last two of the four tokens CCA allows for new DSCs
+#         since 21/09/2026 — a PC with only that driver showed "No certificates found" until someone browsed to it.
+# 2.6.6 = signs .be / .sb / JSON on a token whose driver refuses the SHA-1 signing method with
+#         "DataInvalid()" (an (n)Code DSC after a driver update: PDFs signed, every .sb failed), and
+#         falls back to raw RSA with the padding done here when plain RSA is refused too.
+APP_VERSION = "2.6.6"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -475,7 +481,7 @@ class LoginScreen:
                      text_color=("#FFFFFF", NAVY), font=_font(28, "bold")).grid(row=0, column=0, pady=(32, 12))
         ctk.CTkLabel(card, text="Log in to Broto", text_color=TEXT,
                      font=_font(22, "bold")).grid(row=1, column=0, padx=40, pady=(0, 20))
-        self.email = ctk.CTkEntry(card, width=320, height=44, corner_radius=10, placeholder_text="Email",
+        self.email = ctk.CTkEntry(card, width=320, height=44, corner_radius=10, placeholder_text="Email or username",
                                   fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=_font(15))
         self.email.grid(row=2, column=0, padx=40)
         self.password = ctk.CTkEntry(card, width=320, height=44, corner_radius=10, placeholder_text="Password",
@@ -496,7 +502,7 @@ class LoginScreen:
     def submit(self) -> None:
         email, password = self.email.get().strip(), self.password.get()
         if not email or not password:
-            self.msg.configure(text="Type your email and password.")
+            self.msg.configure(text="Type your email or username, and password.")
             return
         self.btn.configure(state="disabled", text="Logging in…")
         self.msg.configure(text="")

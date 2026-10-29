@@ -86,7 +86,11 @@ source, the app only logs that a new version is out. **Every release must bump
    with the WD ProxKey software have only that one (v2.6.2). The **mToken
    CryptoID** driver, `C:\Windows\System32\CryptoIDA_pkcs11.dll`, is found
    too (v2.6.4). Its utility also lists a copy in `SysWOW64`: that one is
-   32-bit and the Signer cannot load it.
+   32-bit and the Signer cannot load it. The **HyperPKI HYP2003** driver,
+   `C:\Windows\System32\HyperPKICsp11_2003.dll`, and the **Precision InnaIT**
+   driver, `C:\Windows\System32\InnaITPKCS11Driver.dll`, are found too
+   (v2.6.5). HYP2003's India software installs `eps2003csp11v2.dll`, which
+   was already on the list.
 3. Enter the **token PIN** → **Connect**. The certificate card shows the holder
    name, the issuing CA and the expiry date (amber inside 30 days, red once
    expired).
@@ -267,6 +271,11 @@ retried, because tokens lock after a few wrong PINs.
   token's driver has no SHA-1 signing method (`CKM_SHA1_RSA_PKCS`; the FIPS
   140-3 mToken CryptoID). The Signer then does the SHA-1 itself and signs with
   plain `CKM_RSA_PKCS`, which gives the same signature bytes (v2.6.4).
+- **"DataInvalid()" on a .be / .sb / JSON file while PDFs sign fine** — the
+  same refusal, worded differently by the driver (an (n)Code DSC after a
+  driver update, 2026-10-29). Treated like "MechanismInvalid()"; a token that
+  also refuses plain `CKM_RSA_PKCS` gets the PKCS#1 v1.5 padding done by the
+  Signer and raw `CKM_RSA_X_509` — still the same signature bytes (v2.6.6).
 - **"Initialisation error (already initialized). Should never see this."** —
   python-pkcs11 keeps one loaded driver per path *text*, so the same DLL named
   with `\` and with `/` was loaded twice and the second start-up call failed.

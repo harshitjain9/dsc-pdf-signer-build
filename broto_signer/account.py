@@ -100,11 +100,11 @@ def login_error_message(err: ApiError) -> str:
     if err.status == 0:
         return "Can't reach Broto. Check the internet on this computer and try again."
     if err.status == 401:
-        return "Wrong email or password. Use the same ones you use on brotoai.com."
+        return "Wrong email, username or password. Use the same ones you use on brotoai.com."
     if err.status == 429:
         return "Too many tries. Wait one minute, then try again."
     if err.status == 422:
-        return "Type your email and password."
+        return "Type your email or username, and password."
     return "Broto could not log you in right now. Try again in a few minutes."
 
 

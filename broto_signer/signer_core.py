@@ -46,7 +46,11 @@ _WINDOWS_MODULES = [
     # SysWOW64, which the 64-bit Signer cannot load (v2.6.4; before, an mToken PC found no
     # driver and showed "No certificates found").
     r"C:\Windows\System32\CryptoIDA_pkcs11.dll",
-    r"C:\Windows\System32\eps2003csp11v2.dll",       # ePass2003 (Watchdata)
+    # HyperPKI HYP2003 (Hypersecu): the driver its own HyperPKI software installs (v2.6.5).
+    r"C:\Windows\System32\HyperPKICsp11_2003.dll",
+    # Precision InnaIT Key: the path its maker's PKCS#11 manual gives (v2.6.5).
+    r"C:\Windows\System32\InnaITPKCS11Driver.dll",
+    r"C:\Windows\System32\eps2003csp11v2.dll",       # ePass2003 (Feitian); HYP2003's India software too
     r"C:\Windows\System32\eps2003csp11.dll",
     r"C:\Windows\System32\wdpkcs.dll",               # Watchdata ProxKey
     r"C:\Windows\System32\eTPKCS11.dll",             # SafeNet / Aladdin eToken
@@ -401,12 +405,22 @@ def open_pdf_for_signing(content: bytes):
 # The PKCS#1 v1.5 DigestInfo header for a SHA-1 digest (RFC 8017 §9.2, note 1).
 _SHA1_DIGEST_INFO = bytes.fromhex("3021300906052b0e03021a05000414")
 
+# The token errors that mean "not this way" for a signing method — the next way is tried.
+_REFUSED_WAY = ("MechanismInvalid", "MechanismParamInvalid", "DataInvalid", "DataLenRange")
+
+
+def _pkcs1_type1_pad(data: bytes, k: int) -> bytes:
+    """PKCS#1 v1.5 signature padding (RFC 8017 §9.2 step 5): 00 01 FF..FF 00 || data."""
+    if len(data) > k - 11:
+        raise ValueError("The DSC key is too small to sign with.")
+    return b"\x00\x01" + b"\xff" * (k - 3 - len(data)) + b"\x00" + data
+
 
 class DscSigner:
     """Opens ONE PKCS#11 session (one PIN entry) and signs many files with one
     chosen certificate. Call close() when done."""
 
-    _raw_rsa = False   # True once the token refused CKM_SHA1_RSA_PKCS (see _double_hash_sign)
+    _way = 0   # which signing way the token takes for .be/.sb/JSON (see _double_hash_sign)
 
     def __init__(self, module: str, pin: str, cert_id: bytes = b"", cert_label: str = "",
                  slot_index: int = 0):
@@ -502,25 +516,46 @@ class DscSigner:
         DigestInfo). Confirmed on real signed BE/SB flat files AND JSON payloads from
         two other CHA tools (Pantasign and Capricorn DSCs) — same math for both.
 
-        A token without CKM_SHA1_RSA_PKCS (the FIPS 140-3 mToken CryptoID answers
-        MechanismInvalid: PDFs signed, every .be failed, 2026-10-26) gets the SHA-1
-        done here and signs the DigestInfo with plain CKM_RSA_PKCS. PKCS#1 v1.5 is
-        deterministic, so the signature is byte-for-byte the same. The token is
-        asked only once per session."""
+        A token that refuses CKM_SHA1_RSA_PKCS gets the SHA-1 done here and the
+        DigestInfo signed with plain CKM_RSA_PKCS — the FIPS 140-3 mToken CryptoID
+        answers MechanismInvalid (PDFs signed, every .be failed, 2026-10-26); an
+        (n)Code DSC on its driver answered DataInvalid (2026-10-29: PDFs signed,
+        every .sb failed, a day after the same token signed them). A token that also
+        refuses that gets the PKCS#1 v1.5 padding done here and raw CKM_RSA_X_509.
+        PKCS#1 v1.5 is deterministic, so all three give byte-for-byte the same
+        signature. Each refused way is asked only once per session."""
         import hashlib
-        from pkcs11 import Mechanism, MechanismInvalid
+        from pkcs11 import Mechanism
+        import pkcs11
+        refused = tuple(getattr(pkcs11, n) for n in _REFUSED_WAY if hasattr(pkcs11, n))
         inner = hashlib.sha256(core).digest()
+        digest_info = _SHA1_DIGEST_INFO + hashlib.sha1(inner).digest()
         key = self._private_key()
-        if not self._raw_rsa:
+        ways = (
+            lambda: key.sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS),
+            lambda: key.sign(digest_info, mechanism=Mechanism.RSA_PKCS),
+            lambda: key.sign(_pkcs1_type1_pad(digest_info, self._modulus_bytes(key)),
+                             mechanism=Mechanism.RSA_X_509),
+        )
+        while self._way < len(ways):
             try:
-                return key.sign(inner, mechanism=Mechanism.SHA1_RSA_PKCS)
-            except MechanismInvalid:
-                self._raw_rsa = True
+                return ways[self._way]()
+            except refused:
+                self._way += 1
+        raise RuntimeError("This DSC token cannot sign .be, .sb or JSON files. "
+                           "Use another DSC token for these files.")
+
+    def _modulus_bytes(self, key) -> int:
+        """The RSA key size in bytes, for padding by hand (CKM_RSA_X_509)."""
+        bits = 0
         try:
-            return key.sign(_SHA1_DIGEST_INFO + hashlib.sha1(inner).digest(), mechanism=Mechanism.RSA_PKCS)
-        except MechanismInvalid:
-            raise RuntimeError("This DSC token cannot sign .be, .sb or JSON files. "
-                               "Use another DSC token for these files.") from None
+            bits = int(key.key_length or 0)
+        except Exception:
+            bits = 0
+        if not bits:
+            from asn1crypto import x509
+            bits = x509.Certificate.load(self._certificate_der()).public_key.bit_size
+        return (bits + 7) // 8
 
     def sign_flatfile(self, in_path: str, out_path: str) -> None:
         """File wrapper around :meth:`sign_flatfile_bytes`."""

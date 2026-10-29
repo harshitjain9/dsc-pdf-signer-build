@@ -56,6 +56,23 @@ def test_mtoken_cryptoid_driver_is_found_on_its_own_and_next_to_proxkey(monkeypa
     assert core.discover_modules() == [core.DEFAULT_WINDOWS_MODULE, mtoken]   # SignatureP11 stays first
 
 
+def test_hyp2003_and_innait_drivers_are_found_on_their_own_and_next_to_proxkey(monkeypatch):
+    """The other two tokens CCA allows for new DSCs since 21/09/2026: a PC with only the HyperPKI
+    HYP2003 or the Precision InnaIT driver showed "No certificates found". Each driver in System32
+    is now found — on its own it is the default, and next to SignatureP11.dll it is read too."""
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    hyp2003 = r"C:\Windows\System32\HyperPKICsp11_2003.dll"
+    innait = r"C:\Windows\System32\InnaITPKCS11Driver.dll"
+    monkeypatch.setattr(core.glob, "glob", lambda pattern: [])
+    for driver in (hyp2003, innait):
+        monkeypatch.setattr(core.os.path, "exists", lambda p, d=driver: p == d)
+        assert core.discover_modules() == [driver]
+        assert core.default_module() == driver
+    monkeypatch.setattr(core.os.path, "exists", lambda p: p in (core.DEFAULT_WINDOWS_MODULE, hyp2003, innait))
+    assert core.discover_modules() == [core.DEFAULT_WINDOWS_MODULE, hyp2003, innait]   # SignatureP11 stays first
+    assert not [p for p in core._WINDOWS_MODULES if "syswow64" in p.lower()]   # 32-bit copies never load
+
+
 def test_a_driver_in_its_own_folder_loads_with_that_folder_on_path(monkeypatch):
     """python-pkcs11 loads a driver with a plain LoadLibraryW, which never looks in the driver's
     own folder for the DLLs it needs — so that folder goes on PATH first, once."""
@@ -389,9 +406,11 @@ def test_sign_pdf_bytes_reads_pdfs_non_strict(monkeypatch):
 
 
 # ------------------------------------------------------------ flat-file signature
-def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True):
+def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True, rsa_x509: bool = False,
+               refusal: str = "MechanismInvalid"):
     """A stand-in for the token's private key (real RSA maths) plus a stub pkcs11
-    module. ``sha1_rsa`` / ``rsa_pkcs`` say which mechanisms the token offers."""
+    module. ``sha1_rsa`` / ``rsa_pkcs`` / ``rsa_x509`` say which mechanisms the token
+    offers; ``refusal`` is the error it answers for the others."""
     import types
 
     import pytest
@@ -399,12 +418,11 @@ def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True):
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-    class MechanismInvalid(Exception):
-        pass
-
     mod = types.ModuleType("pkcs11")
-    mod.Mechanism = types.SimpleNamespace(SHA1_RSA_PKCS="SHA1_RSA_PKCS", RSA_PKCS="RSA_PKCS")
-    mod.MechanismInvalid = MechanismInvalid
+    mod.Mechanism = types.SimpleNamespace(SHA1_RSA_PKCS="SHA1_RSA_PKCS", RSA_PKCS="RSA_PKCS",
+                                          RSA_X_509="RSA_X_509")
+    for name in ("MechanismInvalid", "DataInvalid"):
+        setattr(mod, name, type(name, (Exception,), {}))
     monkeypatch.setitem(sys.modules, "pkcs11", mod)
     priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     n, d, k = priv.public_key().public_numbers().n, priv.private_numbers().d, 256
@@ -420,9 +438,13 @@ def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True):
             if mechanism == "RSA_PKCS" and rsa_pkcs:     # pad as PKCS#1 v1.5 type 1, raw RSA
                 em = b"\x00\x01" + b"\xff" * (k - 3 - len(data)) + b"\x00" + data
                 return pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
-            raise MechanismInvalid()
+            if mechanism == "RSA_X_509" and rsa_x509:    # raw RSA on bytes padded by the caller
+                assert len(data) == k
+                return pow(int.from_bytes(data, "big"), d, n).to_bytes(k, "big")
+            raise getattr(mod, refusal)()
 
     key = Key()
+    key.key_length = 2048
     signer = core.DscSigner.__new__(core.DscSigner)
     signer._private_key = lambda: key
     signer._certificate_der = lambda: b"CERT"
@@ -455,6 +477,35 @@ def test_a_token_with_sha1_rsa_still_signs_the_old_way(monkeypatch):
     signer, key, _ = _token_key(monkeypatch, sha1_rsa=True)
     signer.sign_flatfile_bytes(b"HREC\r\n")
     assert key.used == ["SHA1_RSA_PKCS"]
+
+
+def test_a_token_answering_data_invalid_signs_flat_files_with_plain_rsa_and_the_same_bytes(monkeypatch):
+    """A customer PC, 2026-10-29: an (n)Code DSC signed PDFs but every .sb failed with "DataInvalid()"
+    — its driver refused CKM_SHA1_RSA_PKCS with that error, not MechanismInvalid, so the
+    plain-RSA way was never tried. A day earlier the same token signed .sb files."""
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    signer, key, priv = _token_key(monkeypatch, sha1_rsa=False, refusal="DataInvalid")
+    content = b"HREC\x1dZZ\x1dTESTCHA01\r\n"
+    inner = hashlib.sha256(content.rstrip(b"\r\n")).digest()
+    assert _signature_of(signer.sign_flatfile_bytes(content)) == priv.sign(inner, padding.PKCS1v15(), hashes.SHA1())
+    assert key.used == ["SHA1_RSA_PKCS", "RSA_PKCS"]
+
+
+def test_a_token_with_only_raw_rsa_signs_flat_files_with_the_same_bytes(monkeypatch):
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    signer, key, priv = _token_key(monkeypatch, sha1_rsa=False, rsa_pkcs=False, rsa_x509=True,
+                                   refusal="DataInvalid")
+    content = b"HREC\x1dZZ\x1dTESTCHA01\r\n"
+    inner = hashlib.sha256(content.rstrip(b"\r\n")).digest()
+    assert _signature_of(signer.sign_flatfile_bytes(content)) == priv.sign(inner, padding.PKCS1v15(), hashes.SHA1())
+    signer.sign_flatfile_bytes(content)
+    assert key.used == ["SHA1_RSA_PKCS", "RSA_PKCS", "RSA_X_509", "RSA_X_509"]
 
 
 def test_a_token_with_neither_method_says_so_in_plain_words(monkeypatch):
