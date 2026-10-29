@@ -17,8 +17,10 @@ cross-platform. Everything runs locally; nothing leaves the machine.
 from __future__ import annotations
 
 import glob
+import ntpath
 import os
 import platform
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Set
@@ -82,6 +84,49 @@ def _candidate_modules() -> List[str]:
         watchdata = sorted(glob.glob(_WATCHDATA_MODULES), reverse=True)
         return _WINDOWS_MODULES[:1] + watchdata + _WINDOWS_MODULES[1:]
     return {"Darwin": _MAC_MODULES}.get(system, _LINUX_MODULES)
+
+
+def dll_arch(path: str) -> str:
+    """The DLL's build from its PE header: x64 (machine 0x8664), x86 (0x14c), else ""."""
+    import struct
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+        pe = struct.unpack_from("<I", head, 0x3C)[0]
+        if head[pe:pe + 4] != b"PE\0\0":
+            return ""
+        machine = struct.unpack_from("<H", head, pe + 4)[0]
+    except (OSError, struct.error):
+        return ""
+    return {0x8664: "x64", 0x14C: "x86"}.get(machine, "")
+
+
+def wow64_copy(module: str) -> str:
+    """The 32-bit copy of a System32 driver (System32\\X.dll → SysWOW64\\X.dll),
+    or "" when there is none. Token software installs both; a 64-bit program
+    sees the real System32 and can only load the 64-bit one."""
+    if platform.system() != "Windows" or not module:
+        return ""
+    windir = ntpath.normcase(os.environ.get("SystemRoot") or r"C:\Windows")
+    sys32 = ntpath.join(windir, "system32") + "\\"
+    path = ntpath.normcase(ntpath.normpath(module))
+    if not path.startswith(sys32):
+        return ""
+    copy = ntpath.join(windir, "syswow64", path[len(sys32):])
+    return copy if os.path.exists(copy) and dll_arch(copy) == "x86" else ""
+
+
+def needs_32bit_signer(module: str, error: str) -> bool:
+    """Should a 64-bit Signer offer the 32-bit one? Yes when the picked driver is
+    itself 32-bit, or when it would not even start here ("OS exception while
+    loading …", e.g. "A dynamic link library (DLL) initialization routine
+    failed") while its 32-bit copy exists — a customer PC, 2026-10-29: the 64-bit
+    SignatureP11.dll broke after a driver update and the 32-bit Signer signed."""
+    if sys.maxsize <= 2 ** 32 or platform.system() != "Windows" or not module:
+        return False
+    if dll_arch(module) == "x86":
+        return True
+    return "while loading" in str(error or "").lower() and bool(wow64_copy(module))
 
 
 def discover_modules() -> List[str]:

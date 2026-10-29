@@ -41,8 +41,8 @@ from account import REFRESH_INTERVAL_S, Account, ApiError, login_error_message
 from bridge import BRIDGE_PORT, BridgeServer, SignRequest
 from remote import DEFAULT_API_BASE, MAX_FIRMS, RemoteLink, SignError, default_api_base, device_report
 from signer_core import (CertInfo, DscSigner, cert_choice_labels, default_module, discover_module,
-                         list_all_certificates, list_certificates, make_batch_folder, pin_error_kind,
-                         present_token_keys, sign_one)
+                         list_all_certificates, list_certificates, make_batch_folder, needs_32bit_signer,
+                         pin_error_kind, present_token_keys, sign_one)
 from updater import Updater, relaunch_command, spawn
 
 APP_TITLE = "Broto DSC Signer"
@@ -77,7 +77,11 @@ APP_TITLE = "Broto DSC Signer"
 # 2.6.6 = signs .be / .sb / JSON on a token whose driver refuses the SHA-1 signing method with
 #         "DataInvalid()" (an (n)Code DSC after a driver update: PDFs signed, every .sb failed), and
 #         falls back to raw RSA with the padding done here when plain RSA is refused too.
-APP_VERSION = "2.6.6"
+# 2.6.7 = a PC whose 64-bit token driver will not start while its 32-bit copy works gets
+#         "Switch to 32-bit": one click downloads the 32-bit Signer and restarts into it (a customer
+#         PC, 2026-10-29: SignatureP11.dll "DLL initialization routine failed"; the 32-bit Signer signed).
+#         The 32-bit Signer updates from its own build (arch=x86) and says "(32-bit)" to Broto.
+APP_VERSION = "2.6.7"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
@@ -1192,6 +1196,11 @@ class SignerApp:
                                         fg_color=(NAVY, LIME), hover_color=("#1B3160", LIME_HOVER),
                                         text_color=("#FFFFFF", NAVY), font=_font(14, "bold"),
                                         command=self._relaunch_to_update)
+        # Shown when this 64-bit Signer can't start the token's driver but its 32-bit copy is there.
+        self.switch_btn = ctk.CTkButton(btn_row, text="Switch to 32-bit", width=170, height=46, corner_radius=12,
+                                        fg_color=(NAVY, LIME), hover_color=("#1B3160", LIME_HOVER),
+                                        text_color=("#FFFFFF", NAVY), font=_font(14, "bold"),
+                                        command=self._switch_to_32bit)
 
     # ---------------------------------------------------------- helpers
     def _make_drop_target(self, w) -> None:
@@ -1668,7 +1677,12 @@ class SignerApp:
             self.certs, self._cert_labels = [], []
             self.cert_menu.grid_forget()
             self._show_cert()
-            self._flash("Couldn't read the token — see Activity log.", ERR)
+            if needs_32bit_signer(self.module_var.get().strip(), item[1]) and self.updater.self_update:
+                self.switch_btn.pack(side="right", padx=(0, 10))
+                self._log("This token's driver works only in the 32-bit Broto Signer. Click Switch to 32-bit.")
+                self._flash("Your token needs the 32-bit Broto Signer. Click Switch to 32-bit.", ERR)
+            else:
+                self._flash("Couldn't read the token — see Activity log.", ERR)
             self._refresh()
         elif kind == "file":
             _, i, state, detail = item
@@ -1822,9 +1836,26 @@ class SignerApp:
                 return
             time.sleep(REFRESH_INTERVAL_S if result == "ok" else 300)
 
+    def _switch_to_32bit(self) -> None:
+        if not self.updater.switch_to_32bit():
+            self._flash("Ask Broto support for the 32-bit Broto Signer.", WARN)
+            return
+        self.switch_btn.configure(state="disabled", text="Getting it…")
+        self._flash("Getting the 32-bit Broto Signer…", MUTED)
+        self._log("Getting the 32-bit Broto Signer…")
+
     def _on_update(self, event: str, info: dict) -> None:
         version = str((info or {}).get("version") or "")
-        if event == "ready":
+        if event == "ready" and (info or {}).get("switch"):
+            self.switch_btn.pack_forget()
+            self.update_btn.pack(side="right", padx=(0, 10))   # stays if signing makes the restart wait
+            self._log("The 32-bit Broto Signer %s is ready. Restarting…" % version)
+            self._relaunch_to_update()
+        elif event == "switch_failed":
+            self.switch_btn.configure(state="normal", text="Switch to 32-bit")
+            self._log("Could not get the 32-bit Broto Signer: %s" % (info or {}).get("error"))
+            self._flash("Couldn't get the 32-bit Broto Signer. Try again in a few minutes.", ERR)
+        elif event == "ready":
             self.update_btn.pack(side="right", padx=(0, 10))
             self._log("Broto Signer %s is ready. Click Relaunch to update." % version)
         elif event == "available":

@@ -52,6 +52,17 @@ def is_newer(candidate: str, current: str) -> bool:
     return bool(a) and a > b
 
 
+def is_32bit() -> bool:
+    """A 32-bit Signer — for a PC whose 64-bit token driver will not start while
+    its 32-bit copy still signs (a customer PC, 2026-10-29). It takes updates from
+    its own build (``arch=x86``), never the 64-bit one."""
+    return sys.maxsize <= 2 ** 32
+
+
+def own_arch() -> str:
+    return "x86" if is_32bit() else "x64"
+
+
 def can_self_update() -> bool:
     """A packaged (PyInstaller) Windows .exe — the only thing we can swap."""
     return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
@@ -197,6 +208,7 @@ class Updater:
         self.ready: Optional[Dict[str, Any]] = None
         self.last_error: Optional[str] = None
         self._told: Optional[str] = None
+        self.arch = own_arch()   # the build this copy updates from; "x86" on a 64-bit copy = switching
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -219,6 +231,20 @@ class Updater:
     def check_now(self) -> None:
         self._wake.set()
 
+    @property
+    def switching(self) -> bool:
+        return self.arch != own_arch()
+
+    def switch_to_32bit(self) -> bool:
+        """A 64-bit copy whose token driver will not start: fetch the 32-bit build
+        on the next check, then ``ready`` (with ``switch``) — the app relaunches
+        into it. False when this copy can't replace itself or already is 32-bit."""
+        if is_32bit() or not self.self_update:
+            return False
+        self.arch, self.ready, self._told = "x86", None, None
+        self.check_now()
+        return True
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             wait = self.interval_s
@@ -238,14 +264,27 @@ class Updater:
         token = self.token_fn()
         if not token:
             return True
+        switching = self.switching
+        # A 64-bit copy asks exactly as before; the 32-bit build has its own (arch=x86),
+        # and a switch sends no version so any published 32-bit build comes back.
+        if switching:
+            query = {"arch": "x86"}
+        else:
+            query = {"current": self.current}
+            if self.arch == "x86":
+                query["arch"] = "x86"
         try:
-            info = call_json(self.api_base, LATEST_PATH, bearer=token, query={"current": self.current},
-                             opener=self._open)
+            info = call_json(self.api_base, LATEST_PATH, bearer=token, query=query, opener=self._open)
         except ApiError as e:
             self.last_error = e.message
+            if switching:
+                self._switch_failed(e.message)
             return False
         version = str(info.get("version") or "")
-        if not info.get("update") or not is_newer(version, self.current):
+        if switching and not info.get("update"):
+            self._switch_failed("Broto has no 32-bit Signer to give yet.")
+            return True
+        if not switching and (not info.get("update") or not is_newer(version, self.current)):
             return True
         if not self.self_update:
             if self._told != version:
@@ -256,10 +295,16 @@ class Updater:
             download(info, self.staged, opener=self._open)
         except (ValueError, OSError) as e:
             self.last_error = str(e)
+            if switching:
+                self._switch_failed(str(e))
             return False
-        self.ready = info
-        self.notify("ready", info)
+        self.ready = dict(info, switch=True) if switching else info
+        self.notify("ready", self.ready)
         return True
+
+    def _switch_failed(self, reason: str) -> None:
+        self.arch = own_arch()           # back to this copy's own updates
+        self.notify("switch_failed", {"error": reason})
 
     def relaunch(self, start: Callable[[List[str]], None] = spawn) -> None:
         """Swap in the downloaded copy and start it (the caller then quits).

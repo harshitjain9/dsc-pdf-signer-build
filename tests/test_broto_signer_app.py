@@ -218,6 +218,73 @@ def test_relaunch_stops_everything_then_swaps_and_quits():
     assert app._token_lock.locked()          # no signature can start while the new copy takes over
 
 
+# ------------------------------------------------------------ Switch to 32-bit
+class _Packable(_Widget):
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.packed = False
+
+    def pack(self, *args, **kwargs):
+        self.packed = True
+
+    def pack_forget(self):
+        self.packed = False
+
+
+class _SwitchUpdater(_Updater):
+    def __init__(self, can_switch=True):
+        super().__init__()
+        self.self_update = True
+        self.can_switch = can_switch
+        self.switched = False
+
+    def switch_to_32bit(self):
+        self.switched = self.can_switch
+        return self.can_switch
+
+
+def _token_error_screen(monkeypatch, offer):
+    app = _update_screen()
+    app.updater = _SwitchUpdater()
+    app.module_var = _Value(r"C:\Windows\System32\SignatureP11.dll")
+    app.connect_btn, app.cert_menu, app.switch_btn, app.update_btn = _Widget(), _Widget(), _Packable(), _Packable()
+    app._show_cert = app._refresh = lambda: None
+    app._log = lambda msg: None
+    monkeypatch.setattr(signer_app, "needs_32bit_signer", lambda module, err: offer)
+    app._handle(("certs_err", "OS exception while loading ...: A dynamic link library (DLL) initialization "
+                              "routine failed."))
+    return app
+
+
+def test_a_driver_that_needs_the_32bit_signer_shows_the_switch_button(monkeypatch):
+    app = _token_error_screen(monkeypatch, offer=True)
+    assert app.switch_btn.packed
+    assert "needs the 32-bit Broto Signer" in app.status_lbl.cget("text")
+
+
+def test_any_other_token_error_shows_no_switch_button(monkeypatch):
+    app = _token_error_screen(monkeypatch, offer=False)
+    assert not app.switch_btn.packed
+    assert "Couldn't read the token" in app.status_lbl.cget("text")
+
+
+def test_the_switch_downloads_then_relaunches_into_the_32bit_signer(monkeypatch):
+    app = _token_error_screen(monkeypatch, offer=True)
+    app._switch_to_32bit()
+    assert app.updater.switched and app.switch_btn.cget("state") == "disabled"
+    app._on_update("ready", {"version": "2.6.7", "switch": True})
+    assert app.updater.relaunched and app.root.destroyed
+    assert not app.switch_btn.packed and app.update_btn.packed
+
+
+def test_a_failed_switch_lets_the_operator_try_again(monkeypatch):
+    app = _token_error_screen(monkeypatch, offer=True)
+    app._switch_to_32bit()
+    app._on_update("switch_failed", {"error": "Broto has no 32-bit Signer to give yet."})
+    assert app.switch_btn.cget("state") == "normal" and not app.updater.relaunched
+    assert "Couldn't get the 32-bit Broto Signer" in app.status_lbl.cget("text")
+
+
 # ------------------------------------------------------------ remote jobs: the certificate Broto names
 TP_ONE, TP_TWO = "11" * 32, "22" * 32
 ONE = CertInfo(label="", subject="CN=HOLDER ONE", cert_id=b"\x01", common_name="HOLDER ONE", thumbprint=TP_ONE,

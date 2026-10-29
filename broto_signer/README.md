@@ -74,6 +74,35 @@ the saved PIN are in `%APPDATA%` and are untouched. Needs PyInstaller ≥ 6.9
 source, the app only logs that a new version is out. **Every release must bump
 `APP_VERSION`** — the check compares it with latest.json.
 
+## 32-bit Signer — for a PC whose 64-bit token driver will not start
+Token software installs its driver twice: 64-bit in `System32`, 32-bit in
+`SysWOW64`. The normal Signer is 64-bit and can only load the first. When an
+update breaks that one while 32-bit programs still sign (a customer PC,
+2026-10-29: `SignatureP11.dll` said "A dynamic link library (DLL)
+initialization routine failed"; another CHA tool marked "(32 bit)" in Task
+Manager still signed, and so did a 32-bit Broto Signer), the 32-bit Signer is
+the fix. Windows sends a 32-bit program's `C:\Windows\System32\...` paths to
+`SysWOW64`, so the driver box still reads `System32` — that is expected.
+
+- **Switch to 32-bit (v2.6.7).** When Connect fails because the driver will
+  not start ("OS exception while loading …") and a 32-bit copy of that driver
+  is in `SysWOW64`, or when the picked driver is itself 32-bit, the 64-bit
+  Signer shows **Switch to 32-bit** (`signer_core.needs_32bit_signer`). The
+  click fetches the 32-bit build (`app-latest?arch=x86`), checks its size and
+  SHA-256, swaps it in like "Relaunch to update" and restarts. Pairing, the
+  saved PIN and settings carry over (`%APPDATA%`, same Windows user).
+- **Its own updates.** The 32-bit Signer asks `app-latest?current=…&arch=x86`
+  and gets `broto-signer/BrotoSigner-x86.exe` + `latest-x86.json` — never the
+  64-bit build. A 64-bit Signer asks exactly as before. The download page
+  serves only the 64-bit build.
+- **Build + publish both on every release.** 32-bit Python
+  (`actions/setup-python` `architecture: x86`); `cryptography==48.0.1
+  --only-binary cryptography` (the newest with a 32-bit Windows package;
+  pyHanko 0.38 needs >= 48.0.0). Publish with
+  `scripts/publish_broto_signer.py <exe> --arch x86`, which refuses a .exe of
+  the other kind (PE header).
+- Broto's DSC computers list shows the PC as "Windows 10 (32-bit)".
+
 ## How to use
 1. Plug in the DSC token.
 2. Launch `BrotoSigner.exe`. The default token driver is

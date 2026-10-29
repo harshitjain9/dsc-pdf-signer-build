@@ -577,3 +577,74 @@ def test_present_token_keys_are_the_keys_the_certificates_carry(monkeypatch):
 
     _fake_pkcs11(monkeypatch, [])
     assert core.present_token_keys("x.dll") == set()
+
+
+# ------------------------------------------------------------ 32-bit Signer offer
+def _pe(machine):
+    head = bytearray(512)
+    head[0:2] = b"MZ"
+    head[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    head[0x80:0x84] = b"PE\0\0"
+    head[0x84:0x86] = machine.to_bytes(2, "little")
+    return bytes(head)
+
+
+def test_dll_arch_reads_the_pe_header(tmp_path):
+    for machine, want in ((0x8664, "x64"), (0x14C, "x86"), (0xAA64, "")):
+        f = tmp_path / ("%x.dll" % machine)
+        f.write_bytes(_pe(machine))
+        assert core.dll_arch(str(f)) == want
+    (tmp_path / "junk.dll").write_bytes(b"not a dll")
+    assert core.dll_arch(str(tmp_path / "junk.dll")) == ""
+    assert core.dll_arch(str(tmp_path / "missing.dll")) == ""
+
+
+def _windows_pc(monkeypatch, wow64_x86=True, picked_arch="x64"):
+    monkeypatch.setattr(core.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(core.sys, "maxsize", 2 ** 63 - 1)
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    copy = r"c:\windows\syswow64\signaturep11.dll"
+    monkeypatch.setattr(core.os.path, "exists", lambda p: wow64_x86 and p == copy)
+    monkeypatch.setattr(core, "dll_arch", lambda p: "x86" if p == copy else picked_arch)
+
+
+LOAD_FAILED = ("OS exception while loading c:\\windows\\system32\\signaturep11.dll: "
+               "A dynamic link library (DLL) initialization routine failed.")
+
+
+def test_a_driver_that_will_not_start_but_has_a_32bit_copy_offers_the_32bit_signer(monkeypatch):
+    """A customer PC, 2026-10-29: the 64-bit SignatureP11.dll broke after a driver update;
+    the 32-bit Signer signed with the 32-bit copy."""
+    _windows_pc(monkeypatch)
+    assert core.wow64_copy(r"C:\Windows\System32\SignatureP11.dll") == r"c:\windows\syswow64\signaturep11.dll"
+    assert core.needs_32bit_signer(r"C:\Windows\System32\SignatureP11.dll", LOAD_FAILED)
+
+
+def test_no_32bit_copy_means_no_offer(monkeypatch):
+    _windows_pc(monkeypatch, wow64_x86=False)
+    assert not core.needs_32bit_signer(r"C:\Windows\System32\SignatureP11.dll", LOAD_FAILED)
+
+
+def test_other_token_errors_never_offer_the_32bit_signer(monkeypatch):
+    _windows_pc(monkeypatch)
+    for err in ("No token present — plug in the DSC and try again.", "CKR_PIN_INCORRECT", ""):
+        assert not core.needs_32bit_signer(r"C:\Windows\System32\SignatureP11.dll", err)
+
+
+def test_a_picked_32bit_driver_offers_the_32bit_signer(monkeypatch):
+    _windows_pc(monkeypatch, picked_arch="x86")
+    assert core.needs_32bit_signer(r"C:\Windows\SysWOW64\SignatureP11.dll", "%1 is not a valid Win32 application")
+
+
+def test_a_driver_outside_system32_has_no_32bit_copy(monkeypatch):
+    _windows_pc(monkeypatch)
+    assert core.wow64_copy(r"C:\Program Files\Token\p11.dll") == ""
+
+
+def test_the_32bit_signer_and_other_systems_never_offer_it(monkeypatch):
+    _windows_pc(monkeypatch)
+    monkeypatch.setattr(core.sys, "maxsize", 2 ** 31 - 1)
+    assert not core.needs_32bit_signer(r"C:\Windows\System32\SignatureP11.dll", LOAD_FAILED)
+    monkeypatch.setattr(core.sys, "maxsize", 2 ** 63 - 1)
+    monkeypatch.setattr(core.platform, "system", lambda: "Darwin")
+    assert not core.needs_32bit_signer(r"C:\Windows\System32\SignatureP11.dll", LOAD_FAILED)

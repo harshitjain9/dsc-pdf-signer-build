@@ -912,3 +912,13 @@ def test_an_empty_second_slot_never_calls_broto():
     second, cls = _slot_link({}, [], 1)
     second._beat()
     assert cls.calls == [] and not second.paired
+
+
+def test_a_32bit_signer_says_so_in_its_platform(monkeypatch):
+    """Broto's DSC computers list then shows which PC runs the 32-bit Signer."""
+    monkeypatch.setattr(remote.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(remote.platform, "release", lambda: "10")
+    monkeypatch.setattr(sys, "maxsize", 2 ** 31 - 1)
+    assert remote._platform() == "Windows 10 (32-bit)"
+    monkeypatch.setattr(sys, "maxsize", 2 ** 63 - 1)
+    assert remote._platform() == "Windows 10"
