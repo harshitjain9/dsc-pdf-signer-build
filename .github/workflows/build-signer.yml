@@ -1,4 +1,4 @@
-name: Build Broto DSC Signer (Windows)
+name: Build Broto DSC Signer (Windows, 32-bit)
 on:
   push:
     branches: ["**"]
@@ -11,6 +11,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: x86
+      - name: The Python is 32-bit
+        run: python -c "import sys, struct; print(sys.version, struct.calcsize('P') * 8, 'bit'); assert sys.maxsize <= 2 ** 32"
       - name: Install dependencies
         working-directory: broto_signer
         run: |
@@ -20,7 +23,7 @@ jobs:
       - name: Signer tests (bridge, settings incl. Windows DPAPI PIN round-trip, screen state)
         run: |
           pip install pytest
-          python -m pytest tests/test_broto_signer_bridge.py tests/test_broto_signer_core.py tests/test_broto_signer_remote.py tests/test_broto_signer_app.py -q
+          python -m pytest tests/test_broto_signer_bridge.py tests/test_broto_signer_core.py tests/test_broto_signer_remote.py tests/test_broto_signer_app.py tests/test_broto_signer_updater.py -q
       - name: Build BrotoSigner.exe
         working-directory: broto_signer
         run: >
@@ -29,6 +32,8 @@ jobs:
           --collect-all pyhanko --collect-all pyhanko_certvalidator
           --collect-all asn1crypto --collect-all pkcs11
           --collect-all customtkinter --collect-all tkinterdnd2 app.py
+      - name: The exe is 32-bit
+        run: python -c "import struct; d = open('broto_signer/dist/BrotoSigner.exe', 'rb').read(4096); pe = struct.unpack_from('<I', d, 0x3C)[0]; m = struct.unpack_from('<H', d, pe + 4)[0]; print('PE machine', hex(m)); assert m == 0x14C"
       - name: Smoke-test the exe starts (login screen, right version) and keeps the bridge shut until login
         shell: pwsh
         run: |
@@ -70,7 +75,7 @@ jobs:
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BrotoSigner-windows
+          name: BrotoSigner-windows-x86
           path: broto_signer/dist/BrotoSigner.exe
           if-no-files-found: error
       - name: Upload screenshots

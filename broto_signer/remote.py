@@ -45,6 +45,7 @@ import json
 import os
 import platform
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -114,8 +115,10 @@ def _hostname() -> str:
 
 
 def _platform() -> str:
+    """The OS name ("Windows 10"); the 32-bit Signer adds " (32-bit)" (updater.is_32bit)."""
     try:
-        return ("%s %s" % (platform.system(), platform.release())).strip()
+        bits = " (32-bit)" if sys.maxsize <= 2 ** 32 else ""
+        return ("%s %s" % (platform.system(), platform.release())).strip() + bits
     except Exception:  # noqa: BLE001
         return ""
 

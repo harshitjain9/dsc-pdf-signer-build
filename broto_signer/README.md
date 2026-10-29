@@ -74,6 +74,21 @@ the saved PIN are in `%APPDATA%` and are untouched. Needs PyInstaller ≥ 6.9
 source, the app only logs that a new version is out. **Every release must bump
 `APP_VERSION`** — the check compares it with latest.json.
 
+## 32-bit build — only for a PC whose 64-bit token driver will not start
+Token software installs its driver twice: 64-bit in `System32`, 32-bit in
+`SysWOW64`. The normal Signer is 64-bit and can only load the first. When an
+update breaks that one while 32-bit programs still sign (a customer PC,
+2026-10-29: `SignatureP11.dll` said "A dynamic link library (DLL)
+initialization routine failed", another CHA tool marked "(32 bit)" in Task
+Manager still signed), build the same code with 32-bit Python
+(`actions/setup-python` `architecture: x86`). Windows sends a 32-bit program's
+`C:\Windows\System32\...` paths to `SysWOW64`, so the driver list and the
+saved driver path need no change. The 32-bit copy never updates itself
+(`updater.is_32bit`): Broto publishes only the 64-bit Signer. It reports its
+platform as "Windows 10 (32-bit)". Hand it to that one PC; never publish it
+to the download page. Pairing, the saved PIN and settings carry over
+(`%APPDATA%`, same Windows user).
+
 ## How to use
 1. Plug in the DSC token.
 2. Launch `BrotoSigner.exe`. The default token driver is

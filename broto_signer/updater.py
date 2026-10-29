@@ -52,6 +52,13 @@ def is_newer(candidate: str, current: str) -> bool:
     return bool(a) and a > b
 
 
+def is_32bit() -> bool:
+    """A 32-bit Signer — built only for a PC whose 64-bit token driver will not
+    start while the 32-bit one still signs (a customer PC, 2026-10-29). Broto
+    publishes only the 64-bit Signer, so this copy never updates itself to it."""
+    return sys.maxsize <= 2 ** 32
+
+
 def can_self_update() -> bool:
     """A packaged (PyInstaller) Windows .exe — the only thing we can swap."""
     return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
@@ -206,6 +213,8 @@ class Updater:
         return staged_path(self.exe)
 
     def start(self) -> None:
+        if is_32bit():          # the published update is the 64-bit Signer this PC cannot use
+            return
         if self.self_update:
             cleanup(self.exe)
         if self._thread is None:
