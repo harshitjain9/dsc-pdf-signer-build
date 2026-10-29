@@ -18,6 +18,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "broto_signer")
 
 import updater  # noqa: E402
 
+REAL_IS_32BIT = updater.is_32bit
+
+
+@pytest.fixture(autouse=True)
+def _a_64bit_signer(monkeypatch):
+    """Every test is a 64-bit Signer unless it says otherwise — the 32-bit build runs
+    these same tests on 32-bit Python (build repo), where the real answer is True."""
+    monkeypatch.setattr(updater, "is_32bit", lambda: False)
+
+
 BASE = "https://api.example"
 NEW_EXE = b"MZ new build " * 100
 
@@ -195,9 +205,9 @@ def test_switch_is_refused_when_already_32bit_or_run_from_source(exe, monkeypatc
 
 def test_only_a_32bit_python_counts_as_32bit(monkeypatch):
     monkeypatch.setattr(sys, "maxsize", 2 ** 31 - 1)
-    assert updater.is_32bit()
+    assert REAL_IS_32BIT()
     monkeypatch.setattr(sys, "maxsize", 2 ** 63 - 1)
-    assert not updater.is_32bit()
+    assert not REAL_IS_32BIT()
 
 
 def test_relaunch_swaps_in_place_and_starts_the_same_path(exe):
