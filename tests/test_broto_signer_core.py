@@ -5,6 +5,8 @@ import os
 import sys
 from datetime import datetime
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "broto_signer"))
 
 import signer_core as core  # noqa: E402
@@ -407,10 +409,12 @@ def test_sign_pdf_bytes_reads_pdfs_non_strict(monkeypatch):
 
 # ------------------------------------------------------------ flat-file signature
 def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True, rsa_x509: bool = False,
-               refusal: str = "MechanismInvalid"):
+               refusal: str = "MechanismInvalid", sha256_rsa: bool = False, sha1_ok: bool = True):
     """A stand-in for the token's private key (real RSA maths) plus a stub pkcs11
-    module. ``sha1_rsa`` / ``rsa_pkcs`` / ``rsa_x509`` say which mechanisms the token
-    offers; ``refusal`` is the error it answers for the others."""
+    module. ``sha1_rsa`` / ``sha256_rsa`` / ``rsa_pkcs`` / ``rsa_x509`` say which
+    mechanisms the token offers; ``refusal`` is the error it answers for the others.
+    ``sha1_ok=False`` = a token that refuses ANY SHA-1 signature, even one handed
+    to plain or raw RSA (it reads the DigestInfo)."""
     import types
 
     import pytest
@@ -419,8 +423,8 @@ def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True, rsa_x509: boo
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
     mod = types.ModuleType("pkcs11")
-    mod.Mechanism = types.SimpleNamespace(SHA1_RSA_PKCS="SHA1_RSA_PKCS", RSA_PKCS="RSA_PKCS",
-                                          RSA_X_509="RSA_X_509")
+    mod.Mechanism = types.SimpleNamespace(SHA1_RSA_PKCS="SHA1_RSA_PKCS", SHA256_RSA_PKCS="SHA256_RSA_PKCS",
+                                          RSA_PKCS="RSA_PKCS", RSA_X_509="RSA_X_509")
     for name in ("MechanismInvalid", "DataInvalid"):
         setattr(mod, name, type(name, (Exception,), {}))
     monkeypatch.setitem(sys.modules, "pkcs11", mod)
@@ -433,6 +437,10 @@ def _token_key(monkeypatch, sha1_rsa: bool, rsa_pkcs: bool = True, rsa_x509: boo
 
         def sign(self, data, mechanism):
             self.used.append(mechanism)
+            if not sha1_ok and core._SHA1_DIGEST_INFO in data:
+                raise getattr(mod, refusal)()
+            if mechanism == "SHA256_RSA_PKCS" and sha256_rsa:
+                return priv.sign(data, padding.PKCS1v15(), hashes.SHA256())
             if mechanism == "SHA1_RSA_PKCS" and sha1_rsa:
                 return priv.sign(data, padding.PKCS1v15(), hashes.SHA1())
             if mechanism == "RSA_PKCS" and rsa_pkcs:     # pad as PKCS#1 v1.5 type 1, raw RSA
@@ -508,10 +516,48 @@ def test_a_token_with_only_raw_rsa_signs_flat_files_with_the_same_bytes(monkeypa
     assert key.used == ["SHA1_RSA_PKCS", "RSA_PKCS", "RSA_X_509", "RSA_X_509"]
 
 
+def _sha256_signature(priv, content):
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    inner = hashlib.sha256(content.rstrip(b"\r\n")).digest()
+    return priv.sign(inner, padding.PKCS1v15(), hashes.SHA256())
+
+
+@pytest.mark.parametrize("sha256_rsa", [True, False], ids=["sha256-mechanism", "plain-rsa"])
+def test_a_token_that_refuses_every_sha1_signature_signs_flat_files_with_sha256(monkeypatch, sha256_rsa):
+    """A customer PC, 2026-10-30: an XtraTrust DSC refused all three SHA-1 ways while
+    another CHA tool's signer signed the same .be with a SHA-256 DigestInfo. The flat
+    file then gets SHA-256( SHA-256(file) ), the SHA-1 ways are asked once per session."""
+    signer, key, priv = _token_key(monkeypatch, sha1_rsa=False, rsa_x509=True, refusal="DataInvalid",
+                                   sha256_rsa=sha256_rsa, sha1_ok=False)
+    content = b"HREC\x1dZZ\x1dTESTCHA01\r\n"
+    assert _signature_of(signer.sign_flatfile_bytes(content)) == _sha256_signature(priv, content)
+    first = ["SHA1_RSA_PKCS", "RSA_PKCS", "RSA_X_509"] + (["SHA256_RSA_PKCS"] if sha256_rsa
+                                                         else ["SHA256_RSA_PKCS", "RSA_PKCS"])
+    assert key.used == first
+    signer.sign_flatfile_bytes(content)
+    assert key.used[len(first):] == ["SHA256_RSA_PKCS" if sha256_rsa else "RSA_PKCS"]
+
+
+def test_json_is_never_signed_with_sha256(monkeypatch):
+    import pytest
+    signer, _, _ = _token_key(monkeypatch, sha1_rsa=False, refusal="DataInvalid", sha256_rsa=True, sha1_ok=False)
+    with pytest.raises(core.SigningRefused, match="cannot sign ICEGATE JSON files"):
+        signer.sign_icegate_json_bytes(b'{"headerField":{}}')
+
+
+def test_a_token_that_takes_sha1_never_uses_sha256(monkeypatch):
+    signer, key, _ = _token_key(monkeypatch, sha1_rsa=True, sha256_rsa=True)
+    signer.sign_flatfile_bytes(b"HREC\r\n")
+    assert key.used == ["SHA1_RSA_PKCS"]
+
+
 def test_a_token_with_neither_method_says_so_in_plain_words(monkeypatch):
     import pytest
     signer, _, _ = _token_key(monkeypatch, sha1_rsa=False, rsa_pkcs=False)
-    with pytest.raises(RuntimeError, match="cannot sign .be, .sb or JSON files"):
+    with pytest.raises(RuntimeError, match="cannot sign .be or .sb files"):
         signer.sign_flatfile_bytes(b"HREC\r\n")
 
 

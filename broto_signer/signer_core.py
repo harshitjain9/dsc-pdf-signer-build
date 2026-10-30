@@ -449,6 +449,12 @@ def open_pdf_for_signing(content: bytes):
 
 # The PKCS#1 v1.5 DigestInfo header for a SHA-1 digest (RFC 8017 §9.2, note 1).
 _SHA1_DIGEST_INFO = bytes.fromhex("3021300906052b0e03021a05000414")
+# ... and for a SHA-256 digest.
+_SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+class SigningRefused(RuntimeError):
+    """The token refused every way of making one kind of signature."""
 
 # The token errors that mean "not this way" for a signing method — the next way is tried.
 _REFUSED_WAY = ("MechanismInvalid", "MechanismParamInvalid", "DataInvalid", "DataLenRange")
@@ -465,7 +471,8 @@ class DscSigner:
     """Opens ONE PKCS#11 session (one PIN entry) and signs many files with one
     chosen certificate. Call close() when done."""
 
-    _way = 0   # which signing way the token takes for .be/.sb/JSON (see _double_hash_sign)
+    _way = 0      # which SHA-1 signing way the token takes for .be/.sb/JSON (see _double_hash_sign)
+    _way256 = 0   # which SHA-256 way it takes for .be/.sb when it refuses every SHA-1 way (_flatfile_sign)
 
     def __init__(self, module: str, pin: str, cert_id: bytes = b"", cert_label: str = "",
                  slot_index: int = 0):
@@ -587,8 +594,45 @@ class DscSigner:
                 return ways[self._way]()
             except refused:
                 self._way += 1
-        raise RuntimeError("This DSC token cannot sign .be, .sb or JSON files. "
-                           "Use another DSC token for these files.")
+        raise SigningRefused("This DSC token cannot sign ICEGATE JSON files. "
+                             "Use another DSC token for these files.")
+
+    def _flatfile_sign(self, core: bytes) -> bytes:
+        """The .be / .sb signature: SHA-1( SHA-256(core) ) as above, or — on a token
+        that refuses every SHA-1 signature — SHA-256( SHA-256(core) ), the same
+        RSA-PKCS#1 v1.5 envelope with a SHA-256 DigestInfo.
+
+        A customer PC, 2026-10-30: an XtraTrust DSC refused all three SHA-1 ways
+        ("This DSC token cannot sign .be, .sb or JSON files") while another CHA
+        tool's signer (V-NCODE_01.05.2013) signed the same .be files with a
+        SHA-256 DigestInfo — of SHA-256(SHA-256(empty)), the same value on every
+        file — and those files are what that office files with. Here the value
+        covers the real file. JSON filings stay SHA-1 only: nothing shows ICEGATE's
+        API takes SHA-256."""
+        import hashlib
+        from pkcs11 import Mechanism
+        import pkcs11
+        try:
+            return self._double_hash_sign(core)
+        except SigningRefused:
+            pass
+        refused = tuple(getattr(pkcs11, n) for n in _REFUSED_WAY if hasattr(pkcs11, n))
+        inner = hashlib.sha256(core).digest()
+        digest_info = _SHA256_DIGEST_INFO + hashlib.sha256(inner).digest()
+        key = self._private_key()
+        ways = (
+            lambda: key.sign(inner, mechanism=Mechanism.SHA256_RSA_PKCS),
+            lambda: key.sign(digest_info, mechanism=Mechanism.RSA_PKCS),
+            lambda: key.sign(_pkcs1_type1_pad(digest_info, self._modulus_bytes(key)),
+                             mechanism=Mechanism.RSA_X_509),
+        )
+        while self._way256 < len(ways):
+            try:
+                return ways[self._way256]()
+            except refused:
+                self._way256 += 1
+        raise SigningRefused("This DSC token cannot sign .be or .sb files. "
+                             "Use another DSC token for these files.")
 
     def _modulus_bytes(self, key) -> int:
         """The RSA key size in bytes, for padding by hand (CKM_RSA_X_509)."""
@@ -615,7 +659,7 @@ class DscSigner:
         value is SHA-1(SHA-256(content with trailing CR/LF stripped))."""
         import base64
         core = content.rstrip(b"\r\n")
-        signature = self._double_hash_sign(core)
+        signature = self._flatfile_sign(core)
         cert_der = self._certificate_der()
         out = core + b"\n"
         out += b"<START-SIGNATURE>" + base64.b64encode(signature) + b"</START-SIGNATURE>\n"

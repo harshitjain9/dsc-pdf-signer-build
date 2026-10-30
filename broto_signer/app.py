@@ -81,7 +81,10 @@ APP_TITLE = "Broto DSC Signer"
 #         "Switch to 32-bit": one click downloads the 32-bit Signer and restarts into it (a customer
 #         PC, 2026-10-29: SignatureP11.dll "DLL initialization routine failed"; the 32-bit Signer signed).
 #         The 32-bit Signer updates from its own build (arch=x86) and says "(32-bit)" to Broto.
-APP_VERSION = "2.6.7"
+# 2.6.8 = signs .be / .sb on a token that refuses every SHA-1 signature: SHA-256( SHA-256(file) )
+#         instead (an XtraTrust DSC, 2026-10-30: "This DSC token cannot sign .be, .sb or JSON files",
+#         while another CHA tool's signer signed the same files with SHA-256). JSON stays SHA-1.
+APP_VERSION = "2.6.8"
 SIGNABLE_EXTS = (".pdf", ".be", ".sb", ".json")
 
 # ------------------------------------------------------------------ palette
